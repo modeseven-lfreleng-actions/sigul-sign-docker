@@ -818,6 +818,10 @@ import_nss_certificates() {
 
     debug "Importing certificates to NSS database for role: $role"
 
+    # Ensure diagnostics directory exists early
+    local diagnostics_dir="${PROJECT_ROOT:-/tmp}/test-artifacts/nss-diagnostics"
+    mkdir -p "$diagnostics_dir"
+
     # Check if NSS database exists
     if [[ ! -f "$nss_dir/cert9.db" ]]; then
         error "NSS database does not exist for role: $role"
@@ -894,22 +898,39 @@ import_nss_certificates() {
             # Also import private key if it exists
             local key_file="${cert_file%.*}-key.pem"
             if [[ -f "$key_file" ]]; then
+                if [[ "$cert_name" == "ca" ]]; then
+                    debug "Skipping private key import for CA certificate: $cert_name"
+                    continue
+                fi
                 log "Importing private key for certificate: $cert_name"
                 # Create temporary PKCS#12 file to import both cert and key
                 local temp_p12=""
                 temp_p12=$(mktemp -t cert.XXXXXXXX.p12)
                 trap 'rm -f "$temp_p12" 2>/dev/null || true' EXIT
 
-                # Convert cert + key to PKCS#12 format (password protected)
+                # Diagnostics directory already created at function start
+
+                # Convert cert + key to PKCS#12 format (password protected) with stderr capture
+                local openssl_stderr="$diagnostics_dir/openssl-pkcs12-${cert_name}-${role}.stderr"
                 if openssl pkcs12 -export -in "$cert_file" -inkey "$key_file" \
                     -out "$temp_p12" -name "$cert_nickname" \
-                    -passout pass:"$nss_password" >/dev/null 2>&1; then
+                    -passout pass:"$nss_password" 2>"$openssl_stderr"; then
 
-                    # Import PKCS#12 into NSS (this updates the existing cert with private key)
-                    if echo "$nss_password" | pk12util -i "$temp_p12" -d "$nss_dir" -W "$nss_password" -K "$nss_password" 2>/dev/null; then
+                    # Import PKCS#12 into NSS (this updates the existing cert with private key) with stderr capture
+                    local pk12util_stderr="$diagnostics_dir/pk12util-${cert_name}-${role}.stderr"
+                    if echo "$nss_password" | pk12util -i "$temp_p12" -d "$nss_dir" -W "$nss_password" -K "$nss_password" 2>"$pk12util_stderr"; then
                         debug "Successfully imported private key for: $cert_name"
+                        # Clean up successful diagnostic files
+                        rm -f "$openssl_stderr" "$pk12util_stderr"
                     else
                         error "Failed to import private key for: $cert_name - this is fatal for daemon roles"
+                        error "pk12util stderr captured in: $pk12util_stderr"
+                        if [[ -s "$pk12util_stderr" ]]; then
+                            error "pk12util error output:"
+                            while IFS= read -r line; do
+                                error "  $line"
+                            done < "$pk12util_stderr"
+                        fi
                         # For server and bridge roles, private key import failure is fatal
                         if [[ "$role" == "server" || "$role" == "bridge" ]]; then
                             return 1
@@ -919,6 +940,13 @@ import_nss_certificates() {
                     fi
                 else
                     error "Failed to create PKCS#12 file for: $cert_name - this is fatal for daemon roles"
+                    error "openssl stderr captured in: $openssl_stderr"
+                    if [[ -s "$openssl_stderr" ]]; then
+                        error "openssl error output:"
+                        while IFS= read -r line; do
+                            error "  $line"
+                        done < "$openssl_stderr"
+                    fi
                     # For server and bridge roles, PKCS#12 creation failure is fatal
                     if [[ "$role" == "server" || "$role" == "bridge" ]]; then
                         return 1
@@ -927,6 +955,7 @@ import_nss_certificates() {
                     fi
                 fi
 
+                # Cleanup temporary PKCS#12 file and clear trap
                 rm -f "$temp_p12" 2>/dev/null || true
                 trap - EXIT
             fi
@@ -934,7 +963,86 @@ import_nss_certificates() {
     done < "$import_list"
 
     log "Imported $imported_count certificate(s) to NSS database for role: $role"
+
+    # Generate NSS import diagnostics summary
+    generate_nss_import_summary "$role" "$diagnostics_dir"
+
     return 0
+}
+
+# Generate comprehensive NSS import diagnostics summary
+generate_nss_import_summary() {
+    local role="$1"
+    local diagnostics_dir="$2"
+    local summary_file="$diagnostics_dir/nss-import-summary-${role}.txt"
+
+    debug "Generating NSS import summary for role: $role"
+
+    {
+        echo "=== NSS Import Diagnostics Summary ==="
+        echo "Role: $role"
+        echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "NSS Directory: $SIGUL_BASE_DIR/nss/$role"
+        echo ""
+
+        echo "=== Certificate Import Status ==="
+        if [[ -f "$SIGUL_BASE_DIR/nss/$role/import_list.txt" ]]; then
+            echo "Import list contents:"
+            while IFS= read -r cert_file; do
+                if [[ -n "$cert_file" ]] && [[ -f "$cert_file" ]]; then
+                    local cert_name
+                    cert_name=$(basename "$cert_file" .crt)
+                    local key_file="${cert_file%.*}-key.pem"
+                    echo "  Certificate: $cert_name"
+                    echo "    Cert file: $cert_file ($(stat -c%s "$cert_file" 2>/dev/null || echo "unknown") bytes)"
+                    if [[ -f "$key_file" ]]; then
+                        echo "    Key file: $key_file ($(stat -c%s "$key_file" 2>/dev/null || echo "unknown") bytes)"
+                    else
+                        echo "    Key file: not found"
+                    fi
+                fi
+            done < "$SIGUL_BASE_DIR/nss/$role/import_list.txt"
+        else
+            echo "No import list found"
+        fi
+        echo ""
+
+        echo "=== Error Diagnostics Files ==="
+        local error_files_found=false
+        for file in "$diagnostics_dir"/*.stderr; do
+            if [[ -f "$file" ]] && [[ -s "$file" ]]; then
+                error_files_found=true
+                echo "Found error file: $(basename "$file")"
+                echo "  Size: $(stat -c%s "$file") bytes"
+                echo "  Content preview (first 5 lines):"
+                head -5 "$file" | sed 's/^/    /'
+                echo ""
+            fi
+        done
+        if [[ "$error_files_found" == "false" ]]; then
+            echo "No error diagnostic files found - all operations succeeded"
+        fi
+        echo ""
+
+        echo "=== Final NSS Database State ==="
+        local nss_password
+        if nss_password=$(load_secret "nss_password" "$role" 2>/dev/null); then
+            echo "Certificates in NSS database:"
+            if echo "$nss_password" | certutil -L -d "$SIGUL_BASE_DIR/nss/$role" -f /dev/stdin 2>/dev/null; then
+                echo "Private keys in NSS database:"
+                echo "$nss_password" | certutil -K -d "$SIGUL_BASE_DIR/nss/$role" -f /dev/stdin 2>/dev/null || echo "  (unable to list private keys)"
+            else
+                echo "  (unable to access NSS database)"
+            fi
+        else
+            echo "  (unable to load NSS password for final validation)"
+        fi
+
+        echo ""
+        echo "=== NSS Import Summary Complete ==="
+    } > "$summary_file"
+
+    debug "NSS import summary written to: $summary_file"
 }
 
 # Validate NSS database integrity

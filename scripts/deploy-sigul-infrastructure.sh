@@ -1518,8 +1518,106 @@ main() {
         error "=== Deployment Failed ==="
         error "Check the logs above for specific error details"
         error "Consider running with --debug flag for more detailed output"
+
+        # Collect NSS diagnostics on deployment failure
+        collect_nss_failure_diagnostics
+
         exit 1
     fi
+}
+
+# Collect NSS failure diagnostics on deployment failure
+collect_nss_failure_diagnostics() {
+    log "Collecting NSS failure diagnostics..."
+
+    local nss_diagnostics_dir="${PROJECT_ROOT}/test-artifacts/nss-diagnostics"
+    local container_diagnostics_dir="${PROJECT_ROOT}/test-artifacts/container-diagnostics"
+
+    # Create diagnostics directories
+    mkdir -p "$nss_diagnostics_dir" "$container_diagnostics_dir"
+
+    # Collect NSS diagnostic files from containers
+    for container in sigul-server sigul-bridge; do
+        if docker ps -a --format "{{.Names}}" | grep -q "^${container}$"; then
+            log "Collecting NSS diagnostics from container: $container"
+
+            # Copy NSS diagnostic files from container if they exist
+            docker exec "$container" find /var/sigul -name "*.stderr" -o -name "*nss-import-summary*" 2>/dev/null | while IFS= read -r file; do
+                if [[ -n "$file" ]]; then
+                    local basename_file
+                    basename_file=$(basename "$file")
+                    docker cp "$container:$file" "$nss_diagnostics_dir/${container}-${basename_file}" 2>/dev/null || true
+                fi
+            done
+
+            # Get current NSS database state
+            docker exec "$container" sh -c '
+                echo "=== NSS Database State for $(hostname) ==="
+                echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                echo ""
+                for role_dir in /var/sigul/nss/*; do
+                    if [[ -d "$role_dir" ]]; then
+                        role=$(basename "$role_dir")
+                        echo "Role: $role"
+                        echo "NSS Directory: $role_dir"
+                        ls -la "$role_dir" 2>/dev/null || echo "Cannot list NSS directory"
+                        echo ""
+                    fi
+                done
+
+                echo "=== Certificate Files ==="
+                find /var/sigul/secrets/certificates -name "*.crt" -o -name "*.pem" 2>/dev/null | while IFS= read -r cert; do
+                    if [[ -f "$cert" ]]; then
+                        echo "Certificate: $cert"
+                        echo "  Size: $(stat -c%s "$cert" 2>/dev/null || echo unknown) bytes"
+                        echo "  Permissions: $(stat -c%a "$cert" 2>/dev/null || echo unknown)"
+                    fi
+                done
+            ' > "$container_diagnostics_dir/${container}-nss-state.txt" 2>&1 || true
+
+            # Collect recent container logs with NSS context
+            docker logs --tail 100 "$container" > "$container_diagnostics_dir/${container}-recent-logs.txt" 2>&1 || true
+        fi
+    done
+
+    # Generate summary of collected diagnostics
+    {
+        echo "=== NSS Failure Diagnostics Summary ==="
+        echo "Collected at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "Project root: $PROJECT_ROOT"
+        echo ""
+
+        echo "=== NSS Diagnostic Files ==="
+        if [[ -d "$nss_diagnostics_dir" ]]; then
+            find "$nss_diagnostics_dir" -type f | while IFS= read -r file; do
+                echo "File: $(basename "$file")"
+                echo "  Size: $(stat -c%s "$file" 2>/dev/null || echo unknown) bytes"
+                if [[ -s "$file" ]]; then
+                    echo "  First few lines:"
+                    head -3 "$file" 2>/dev/null | sed 's/^/    /' || echo "    (unable to read)"
+                fi
+                echo ""
+            done
+        else
+            echo "No NSS diagnostics directory found"
+        fi
+
+        echo "=== Container Diagnostic Files ==="
+        if [[ -d "$container_diagnostics_dir" ]]; then
+            find "$container_diagnostics_dir" -type f | while IFS= read -r file; do
+                echo "File: $(basename "$file")"
+                echo "  Size: $(stat -c%s "$file" 2>/dev/null || echo unknown) bytes"
+            done
+        else
+            echo "No container diagnostics directory found"
+        fi
+    } > "${PROJECT_ROOT}/test-artifacts/nss-failure-summary.txt"
+
+    log "NSS failure diagnostics collected in: ${PROJECT_ROOT}/test-artifacts/"
+    error "Key diagnostic files:"
+    error "  - NSS diagnostics: test-artifacts/nss-diagnostics/"
+    error "  - Container states: test-artifacts/container-diagnostics/"
+    error "  - Summary: test-artifacts/nss-failure-summary.txt"
 }
 
 # Execute main function with all arguments
