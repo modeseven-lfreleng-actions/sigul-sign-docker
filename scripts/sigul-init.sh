@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
+# shellcheck disable=SC2317  # Disable unreachable code false positives from complex error handling
+
 # Unified Sigul Initialization Script
 # This script replaces the separate sigul-server-init.sh and sigul-bridge-init.sh scripts
 # with a unified, modular approach supporting all sigul components.
@@ -807,6 +809,7 @@ create_nss_database() {
 }
 
 # Import certificates into NSS database
+# shellcheck disable=SC2317  # Complex error handling creates false positive unreachable code warnings
 import_nss_certificates() {
     local role="$1"
     local nss_dir="$SIGUL_BASE_DIR/nss/$role"
@@ -906,10 +909,22 @@ import_nss_certificates() {
                     if echo "$nss_password" | pk12util -i "$temp_p12" -d "$nss_dir" -W "$nss_password" -K "$nss_password" 2>/dev/null; then
                         debug "Successfully imported private key for: $cert_name"
                     else
-                        log "Warning: Failed to import private key for: $cert_name (certificate import succeeded)"
+                        error "Failed to import private key for: $cert_name - this is fatal for daemon roles"
+                        # For server and bridge roles, private key import failure is fatal
+                        if [[ "$role" == "server" || "$role" == "bridge" ]]; then
+                            return 1
+                        else
+                            log "Warning: Failed to import private key for: $cert_name (certificate import succeeded)"
+                        fi
                     fi
                 else
-                    log "Warning: Failed to create PKCS#12 file for: $cert_name"
+                    error "Failed to create PKCS#12 file for: $cert_name - this is fatal for daemon roles"
+                    # For server and bridge roles, PKCS#12 creation failure is fatal
+                    if [[ "$role" == "server" || "$role" == "bridge" ]]; then
+                        return 1
+                    else
+                        log "Warning: Failed to create PKCS#12 file for: $cert_name"
+                    fi
                 fi
 
                 rm -f "$temp_p12" 2>/dev/null || true
@@ -982,8 +997,151 @@ setup_nss_database() {
         error "NSS database validation failed for role: $role"
     fi
 
+    # Step 5: Perform deep integrity check
+    if ! perform_nss_integrity_deep_check "$role"; then
+        error "NSS deep integrity check failed for role: $role"
+    fi
+
     log "NSS database setup completed successfully for role: $role"
     return 0
+}
+
+# Perform deep NSS integrity check with private key validation
+# shellcheck disable=SC2317  # Complex error handling creates false positive unreachable code warnings
+perform_nss_integrity_deep_check() {
+    local role="$1"
+    local nss_dir="$SIGUL_BASE_DIR/nss/$role"
+    local artifacts_dir="${PROJECT_ROOT:-/tmp}/test-artifacts"
+    local integrity_file="$artifacts_dir/nss-integrity-${role}.txt"
+
+    log "Performing NSS deep integrity check for role: $role"
+
+    # Ensure artifacts directory exists
+    mkdir -p "$artifacts_dir"
+
+    # Load the NSS password
+    local nss_password
+    if ! nss_password=$(load_secret "nss_password" "$role"); then
+        error "Failed to load NSS password for deep integrity check"
+        return 1
+    fi
+
+    # Create comprehensive integrity report
+    {
+        echo "=== NSS Deep Integrity Check Report ==="
+        echo "Role: $role"
+        echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "NSS Directory: $nss_dir"
+        echo ""
+
+        echo "=== Certificate Database Listing (certutil -L) ==="
+        if echo "$nss_password" | certutil -L -d "$nss_dir" -f /dev/stdin 2>&1; then
+            echo "✅ Certificate listing successful"
+        else
+            echo "❌ Certificate listing failed"
+            echo ""
+            echo "=== End of Integrity Check (FAILED) ==="
+            return 1
+        fi
+        echo ""
+
+        echo "=== Private Key Database Listing (certutil -K) ==="
+        local key_list_result
+        if key_list_result=$(echo "$nss_password" | certutil -K -d "$nss_dir" -f /dev/stdin 2>&1); then
+            echo "$key_list_result"
+            echo "✅ Private key listing successful"
+
+            # Check for expected private keys based on role
+            local expected_keys=()
+            case "$role" in
+                "server")
+                    expected_keys=("sigul-server-cert")
+                    ;;
+                "bridge")
+                    expected_keys=("sigul-bridge-cert")
+                    ;;
+                "client")
+                    expected_keys=("sigul-client-cert")
+                    ;;
+            esac
+
+            echo ""
+            echo "=== Private Key Validation ==="
+            local missing_keys=()
+            local found_keys=()
+
+            for expected_key in "${expected_keys[@]}"; do
+                if echo "$key_list_result" | grep -q "$expected_key"; then
+                    echo "✅ Found expected private key: $expected_key"
+                    found_keys+=("$expected_key")
+                else
+                    echo "❌ Missing expected private key: $expected_key"
+                    missing_keys+=("$expected_key")
+                fi
+            done
+
+            echo ""
+            echo "=== Key Validation Summary ==="
+            echo "Expected keys: ${expected_keys[*]}"
+            echo "Found keys: ${found_keys[*]}"
+            echo "Missing keys: ${missing_keys[*]}"
+
+            # For daemon roles (server/bridge), missing private keys are fatal
+            if [[ ${#missing_keys[@]} -gt 0 ]] && [[ "$role" == "server" || "$role" == "bridge" ]]; then
+                echo ""
+                echo "❌ FATAL: Missing private keys for daemon role '$role'"
+                echo "This will prevent daemon startup - failing pre-daemon check"
+                echo ""
+                echo "=== End of Integrity Check (FAILED) ==="
+                return 1
+            fi
+
+        else
+            echo "$key_list_result"
+            echo "❌ Private key listing failed"
+            echo ""
+            echo "=== End of Integrity Check (FAILED) ==="
+            return 1
+        fi
+        echo ""
+
+        echo "=== NSS Database File Information ==="
+        ls -la "$nss_dir"/ 2>/dev/null || echo "Cannot list NSS directory files"
+        echo ""
+
+        echo "=== Database File Integrity ==="
+        for db_file in "$nss_dir/cert9.db" "$nss_dir/key4.db" "$nss_dir/pkcs11.txt"; do
+            if [[ -f "$db_file" ]]; then
+                local file_size
+                local file_perms
+                file_size=$(stat -c%s "$db_file" 2>/dev/null || echo "unknown")
+                file_perms=$(stat -c%a "$db_file" 2>/dev/null || echo "unknown")
+                echo "✅ $(basename "$db_file"): size=${file_size}B, perms=${file_perms}"
+            else
+                echo "❌ Missing database file: $(basename "$db_file")"
+            fi
+        done
+        echo ""
+
+        echo "✅ NSS Deep Integrity Check PASSED"
+        echo "=== End of Integrity Check (SUCCESS) ==="
+
+    } > "$integrity_file" 2>&1
+
+    # Set readable permissions for retrieval
+    chmod 644 "$integrity_file" 2>/dev/null || true
+
+    # Also output summary to log
+    debug "NSS integrity check report saved: $integrity_file"
+
+    # Validate the check actually passed by examining the output
+    if grep -q "NSS Deep Integrity Check PASSED" "$integrity_file"; then
+        debug "NSS deep integrity check passed for role: $role"
+        return 0
+    else
+        error "NSS deep integrity check failed for role: $role - see $integrity_file"
+        return 1
+    fi
 }
 
 #######################################
@@ -1315,8 +1473,119 @@ create_configuration() {
         error "Configuration validation failed for role: $role"
     fi
 
+    # Perform config drift detection
+    if ! detect_config_drift; then
+        warn "Configuration drift detected - see diagnostics for details"
+    fi
+
     log "Configuration created and validated successfully for role: $role"
     return 0
+}
+
+# Config drift detection
+detect_config_drift() {
+    local role="$SIGUL_ROLE"
+    local config_dir="$SIGUL_BASE_DIR/config"
+    local artifacts_dir="${PROJECT_ROOT:-/tmp}/test-artifacts"
+    local digests_file="$artifacts_dir/config-digests.json"
+
+    log "Performing config drift detection for role: $role"
+
+    # Ensure artifacts directory exists
+    mkdir -p "$artifacts_dir"
+
+    # Load existing digests if they exist
+    local existing_digests='{}'
+    if [[ -f "$digests_file" ]]; then
+        existing_digests=$(cat "$digests_file" 2>/dev/null || echo '{}')
+    fi
+
+    # Calculate current config hashes
+    local current_digests='{}'
+    local drift_detected="false"
+    local drift_details='[]'
+
+    # Hash all configuration files for this role
+    local config_files=()
+    case "$role" in
+        "server")
+            config_files=("$config_dir/server.conf")
+            ;;
+        "bridge")
+            config_files=("$config_dir/bridge.conf")
+            ;;
+        "client")
+            config_files=("$config_dir/client.conf")
+            ;;
+    esac
+
+    for config_file in "${config_files[@]}"; do
+        if [[ -f "$config_file" ]]; then
+            local filename
+            filename=$(basename "$config_file")
+            local file_hash
+            if command -v sha256sum >/dev/null 2>&1; then
+                file_hash=$(sha256sum "$config_file" | awk '{print $1}')
+            else
+                # Fallback for systems without sha256sum
+                file_hash=$(openssl dgst -sha256 "$config_file" | awk '{print $NF}')
+            fi
+
+            # Add to current digests
+            current_digests=$(echo "$current_digests" | jq --arg file "$filename" --arg hash "$file_hash" '.[$file] = $hash')
+
+            # Check for drift
+            local existing_hash
+            existing_hash=$(echo "$existing_digests" | jq -r --arg file "$filename" '.[$file] // null')
+
+            if [[ "$existing_hash" != "null" && "$existing_hash" != "$file_hash" ]]; then
+                drift_detected="true"
+                local drift_info
+                drift_info=$(jq -n --arg file "$filename" --arg old_hash "$existing_hash" --arg new_hash "$file_hash" --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
+                    "file": $file,
+                    "oldHash": $old_hash,
+                    "newHash": $new_hash,
+                    "detectedAt": $timestamp
+                }')
+                drift_details=$(echo "$drift_details" | jq --argjson drift "$drift_info" '. += [$drift]')
+                warn "Config drift detected in $filename: $existing_hash -> $file_hash"
+            elif [[ "$existing_hash" == "null" ]]; then
+                debug "New config file detected: $filename ($file_hash)"
+            else
+                debug "Config file unchanged: $filename ($file_hash)"
+            fi
+        fi
+    done
+
+    # Update digests file with current hashes and drift information
+    local updated_digests
+    updated_digests=$(jq -n \
+        --argjson existing "$existing_digests" \
+        --argjson current "$current_digests" \
+        --argjson drift_detected "$drift_detected" \
+        --argjson drift_details "$drift_details" \
+        --arg role "$role" \
+        --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{
+            "digests": ($existing + $current),
+            "lastUpdated": $timestamp,
+            "lastRole": $role,
+            "driftDetected": $drift_detected,
+            "driftHistory": $drift_details
+        }')
+
+    echo "$updated_digests" > "$digests_file"
+    chmod 644 "$digests_file" 2>/dev/null || true
+
+    debug "Config digests updated: $digests_file"
+
+    if [[ "$drift_detected" == "true" ]]; then
+        warn "Configuration drift detected - changes logged to $digests_file"
+        return 1
+    else
+        debug "No configuration drift detected"
+        return 0
+    fi
 }
 
 #######################################
@@ -1504,6 +1773,7 @@ setup_database() {
 #######################################
 
 # Validate all secrets are present and valid
+# shellcheck disable=SC2317  # Complex error handling creates false positive unreachable code warnings
 validate_secrets() {
     local role="$SIGUL_ROLE"
 
@@ -1512,14 +1782,16 @@ validate_secrets() {
     # Check NSS password for all roles
     local nss_password_file="$SECRETS_DIR/${role}_nss_password"
     if [[ ! -f "$nss_password_file" ]]; then
-        debug "NSS password file missing: $nss_password_file"
+        error "NSS password file missing: $nss_password_file"
+        return 1
     fi
 
     # Validate file permissions
     local perms
     perms=$(stat -c "%a" "$nss_password_file" 2>/dev/null)
     if [[ "$perms" != "600" ]]; then
-        error "Admin password file has incorrect permissions: $perms (expected 600)"
+        error "NSS password file has incorrect permissions: $perms (expected 600)"
+        return 1
     fi
 
     # Check admin password for server role
@@ -1527,13 +1799,14 @@ validate_secrets() {
         local admin_password_file="$SECRETS_DIR/server_admin_password"
         # Check if admin password exists
         if [[ ! -f "$admin_password_file" ]]; then
-            debug "Admin password file missing: $admin_password_file"
+            error "Admin password file missing: $admin_password_file"
             return 1
         fi
 
         perms=$(stat -c "%a" "$admin_password_file" 2>/dev/null)
         if [[ "$perms" != "600" ]]; then
-            error "NSS password file has incorrect permissions: $perms (expected 600)"
+            error "Admin password file has incorrect permissions: $perms (expected 600)"
+            return 1
         fi
     fi
 
@@ -1550,15 +1823,19 @@ validate_certificates() {
 
     # Define expected certificates by role
     local expected_certs=()
+    local expected_keys=()
     case "$role" in
         "server")
             expected_certs=("server.crt" "ca.crt")
+            expected_keys=("server-key.pem")
             ;;
         "bridge")
-            expected_certs=("bridge.crt")
+            expected_certs=("bridge.crt" "ca.crt")
+            expected_keys=("bridge-key.pem")
             ;;
         "client")
-            expected_certs=("client.crt")
+            expected_certs=("client.crt" "ca.crt")
+            expected_keys=("client-key.pem")
             ;;
     esac
 
@@ -1566,13 +1843,34 @@ validate_certificates() {
     for cert in "${expected_certs[@]}"; do
         local cert_path="$cert_dir/$cert"
         if [[ ! -f "$cert_path" ]]; then
-            debug "Certificate missing: $cert_path"
+            error "Certificate missing: $cert_path"
+            return 1
+        fi
+
+        # Validate certificate file size (must be > 0)
+        if [[ ! -s "$cert_path" ]]; then
+            error "Certificate file is empty: $cert_path"
             return 1
         fi
 
         # Validate certificate using OpenSSL
         if ! openssl x509 -in "$cert_path" -noout -checkend 86400 >/dev/null 2>&1; then
-            debug "Certificate is invalid or expires within 24 hours: $cert_path"
+            error "Certificate is invalid or expires within 24 hours: $cert_path"
+            return 1
+        fi
+    done
+
+    # Check each expected private key
+    for key in "${expected_keys[@]}"; do
+        local key_path="$cert_dir/$key"
+        if [[ ! -f "$key_path" ]]; then
+            error "Private key missing: $key_path"
+            return 1
+        fi
+
+        # Validate key file size (must be > 0)
+        if [[ ! -s "$key_path" ]]; then
+            error "Private key file is empty: $key_path"
             return 1
         fi
     done
@@ -1704,20 +2002,112 @@ check_service_readiness() {
     return 0
 }
 
-# Main health check orchestration - simplified for debugging
+# Validate NSS database has expected certificate nicknames
+# shellcheck disable=SC2317  # Complex error handling creates false positive unreachable code warnings
+validate_nss_nicknames() {
+    local role="$SIGUL_ROLE"
+    local nss_dir="$NSS_DIR/$role"
+
+    debug "Validating NSS certificate nicknames for role: $role"
+
+    # Load the NSS password
+    local nss_password
+    if ! nss_password=$(load_secret "nss_password" "$role" 2>/dev/null); then
+        error "Failed to load NSS password for role: $role"
+        return 1
+    fi
+
+    # Test NSS database accessibility
+    if ! echo "$nss_password" | certutil -L -d "$nss_dir" -f /dev/stdin >/dev/null 2>&1; then
+        error "NSS database is not accessible for role: $role"
+        return 1
+    fi
+
+    # Define expected nicknames by role
+    local expected_nicknames=()
+    case "$role" in
+        "server")
+            expected_nicknames=("sigul-server-cert" "sigul-ca-cert")
+            ;;
+        "bridge")
+            expected_nicknames=("sigul-bridge-cert" "sigul-ca-cert")
+            ;;
+        "client")
+            expected_nicknames=("sigul-client-cert" "sigul-ca-cert")
+            ;;
+    esac
+
+    # Check for expected certificate nicknames
+    for nickname in "${expected_nicknames[@]}"; do
+        if ! echo "$nss_password" | certutil -L -d "$nss_dir" -f /dev/stdin | grep -q "$nickname"; then
+            error "NSS database missing expected certificate nickname: $nickname"
+            return 1
+        fi
+    done
+
+    debug "NSS nickname validation passed for role: $role"
+    return 0
+}
+
+# Main health check orchestration - comprehensive validation
 perform_health_check() {
-    log "Performing simplified health check for role: $SIGUL_ROLE (debugging mode)"
+    log "Performing comprehensive health check for role: $SIGUL_ROLE"
 
     local checks_passed=0
-    local checks_total=1
+    local checks_total=5
 
-    # Run only secrets validation first for debugging
+    # Run secrets validation
     log "Testing: validate_secrets"
     if validate_secrets; then
         log "✓ Secrets validation passed"
         checks_passed=$((checks_passed + 1))
     else
         log "✗ Secrets validation failed"
+        return 1
+    fi
+
+    # Run certificate validation
+    log "Testing: validate_certificates"
+    if validate_certificates; then
+        log "✓ Certificate validation passed"
+        checks_passed=$((checks_passed + 1))
+    else
+        log "✗ Certificate validation failed"
+        return 1
+    fi
+
+    # Run NSS nickname validation
+    log "Testing: validate_nss_nicknames"
+    if validate_nss_nicknames; then
+        log "✓ NSS nickname validation passed"
+        checks_passed=$((checks_passed + 1))
+    else
+        log "✗ NSS nickname validation failed"
+        return 1
+    fi
+
+    # Run NSS deep integrity check (for daemon roles)
+    if [[ "$SIGUL_ROLE" == "server" || "$SIGUL_ROLE" == "bridge" ]]; then
+        log "Testing: perform_nss_integrity_deep_check"
+        if perform_nss_integrity_deep_check "$SIGUL_ROLE"; then
+            log "✓ NSS deep integrity check passed"
+            checks_passed=$((checks_passed + 1))
+        else
+            log "✗ NSS deep integrity check failed"
+            return 1
+        fi
+    else
+        log "Skipping NSS deep integrity check for non-daemon role: $SIGUL_ROLE"
+        checks_passed=$((checks_passed + 1))
+    fi
+
+    # Run service readiness check
+    log "Testing: check_service_readiness"
+    if check_service_readiness; then
+        log "✓ Service readiness check passed"
+        checks_passed=$((checks_passed + 1))
+    else
+        log "✗ Service readiness check failed"
         return 1
     fi
 
@@ -1774,6 +2164,20 @@ start_server() {
         error "Server configuration not found: $server_config" "$EXIT_CONFIG_ERROR"
     fi
 
+    # Enforce ordered initialization dependency - bridge must be reachable
+    if ! verify_bridge_reachability; then
+        error "Bridge dependency check failed - server cannot start" "$EXIT_DEPENDENCY_MISSING"
+    fi
+
+    # Check daemon flag support
+    local support_internal_flags=1
+    if ! sigul_server --help 2>&1 | grep -q -- '--internal-log-dir'; then
+        support_internal_flags=0
+        log "Server binary does not support --internal-log-dir/--internal-pid-dir; using standard startup"
+    else
+        debug "Server binary supports --internal-log-dir/--internal-pid-dir flags"
+    fi
+
     # Create PID file path
     local pid_file="$PIDS_DIR/sigul_server.pid"
     local log_file="$LOGS_DIR/server/daemon.log"
@@ -1784,8 +2188,12 @@ start_server() {
     log "Server daemon configuration:"
     debug "  Config file: $server_config"
     debug "  PID file: $pid_file"
-    debug "  Log directory: $LOGS_DIR/server (via --internal-log-dir)"
-    debug "  Expected log file: $log_file"
+    if [[ $support_internal_flags -eq 1 ]]; then
+        debug "  Log directory: $LOGS_DIR/server (via --internal-log-dir)"
+        debug "  Expected log file: $log_file"
+    else
+        debug "  Log directory: default sigul logging (internal flags not supported)"
+    fi
     debug "  Database: $DATABASE_DIR/sigul.db"
 
     # Start the server daemon
@@ -1798,12 +2206,26 @@ start_server() {
 
     # Use exec to replace the current process (standard for Docker containers)
     # Run in foreground (no -d flag) for Docker containers
-    # Try basic startup first without internal directory options
-    debug "Attempting basic sigul_server startup with explicit internal dirs..."
-    # Explicitly pass internal log and pid directories (both required by daemon)
-    debug "  Using internal log dir: $LOGS_DIR/server"
-    debug "  Using internal pid dir: $PIDS_DIR"
-    exec sigul_server -c "$server_config" -v --internal-log-dir "$LOGS_DIR/server" --internal-pid-dir "$PIDS_DIR"
+    # Wrap in a subshell to capture exit codes for first-failure diagnostics
+    set +e
+    if [[ $support_internal_flags -eq 1 ]]; then
+        debug "Using sigul_server with internal directory flags"
+        debug "  Using internal log dir: $LOGS_DIR/server"
+        debug "  Using internal pid dir: $PIDS_DIR"
+        sigul_server -c "$server_config" -v --internal-log-dir "$LOGS_DIR/server" --internal-pid-dir "$PIDS_DIR"
+        server_rc=$?
+    else
+        debug "Using sigul_server with standard configuration"
+        sigul_server -c "$server_config" -v
+        server_rc=$?
+    fi
+    set -e
+
+    # Capture first-failure diagnostic snapshot if server exits with non-zero code
+    if [[ $server_rc -ne 0 ]]; then
+        capture_fatal_exit_snapshot "server" "$server_rc"
+        exit "$server_rc"
+    fi
 }
 
 # Start sigul_bridge daemon
@@ -1821,6 +2243,15 @@ start_bridge() {
         error "Bridge configuration not found: $bridge_config" "$EXIT_CONFIG_ERROR"
     fi
 
+    # Check daemon flag support
+    local support_internal_flags=1
+    if ! sigul_bridge --help 2>&1 | grep -q -- '--internal-log-dir'; then
+        support_internal_flags=0
+        log "Bridge binary does not support --internal-log-dir/--internal-pid-dir; using standard startup"
+    else
+        debug "Bridge binary supports --internal-log-dir/--internal-pid-dir flags"
+    fi
+
     # Create PID file path
     local pid_file="$PIDS_DIR/sigul_bridge.pid"
     local log_file="$LOGS_DIR/bridge/daemon.log"
@@ -1831,8 +2262,12 @@ start_bridge() {
     log "Bridge daemon configuration:"
     debug "  Config file: $bridge_config"
     debug "  PID file: $pid_file"
-    debug "  Log directory: $LOGS_DIR/bridge (via --internal-log-dir)"
-    debug "  Expected log file: $log_file"
+    if [[ $support_internal_flags -eq 1 ]]; then
+        debug "  Log directory: $LOGS_DIR/bridge (via --internal-log-dir)"
+        debug "  Expected log file: $log_file"
+    else
+        debug "  Log directory: default sigul logging (internal flags not supported)"
+    fi
     debug "  Bridge client port: ${SIGUL_BRIDGE_CLIENT_PORT:-44334}"
     debug "  Bridge server port: ${SIGUL_BRIDGE_SERVER_PORT:-44333}"
     debug "  Bridge bind address: 0.0.0.0 (hardcoded in Sigul, not configurable)"
@@ -1847,11 +2282,8 @@ start_bridge() {
 
     # Use exec to replace the current process (standard for Docker containers)
     # Run in foreground (no -d flag) for Docker containers
-    # Try basic startup first without internal directory options
-    debug "Attempting basic sigul_bridge startup with explicit internal dirs and wrapper capture..."
-    # Wrapper to capture early-exit errors before container restarts
-    debug "  Using internal log dir: $LOGS_DIR/bridge"
-    debug "  Using internal pid dir: $PIDS_DIR"
+    debug "Starting sigul_bridge with wrapper capture for diagnostics..."
+
     wrapper_log="$LOGS_DIR/bridge/daemon.stdout.log"
     startup_err_file="$LOGS_DIR/bridge/startup_errors.log"
     # Ensure log directory exists
@@ -1877,16 +2309,70 @@ start_bridge() {
         echo
         echo "Environment (filtered):"
         env | grep -E '^SIGUL_|^NSS_|^DEBUG=' || true
+        echo "Internal flags support: $support_internal_flags"
         echo "==============================="
     } >> "$wrapper_log" 2>&1
 
     start_time=$(date +%s)
     set +e
-    # Run bridge in foreground, capture output, and pass explicit internal dirs
-    sigul_bridge -c "$bridge_config" -v --internal-log-dir "$LOGS_DIR/bridge" --internal-pid-dir "$PIDS_DIR" 2>&1 | tee -a "$wrapper_log"
+
+    # Check if strace should wrap the first attempt
+    local use_strace="${SIGUL_ENABLE_STRACE:-0}"
+    local strace_file="$LOGS_DIR/bridge/strace.bridge.txt"
+    local strace_summary_file="$LOGS_DIR/bridge/strace.summary.txt"
+
+    # Run bridge in foreground, capture output, with optional strace wrapping
+    if [[ "$use_strace" == "1" && -x "$(command -v strace)" ]]; then
+        debug "Starting sigul_bridge with strace enabled (first attempt)"
+        if [[ $support_internal_flags -eq 1 ]]; then
+            debug "  Using strace + internal directory flags"
+            strace -tt -f -o "$strace_file" \
+                sigul_bridge -c "$bridge_config" -v --internal-log-dir "$LOGS_DIR/bridge" --internal-pid-dir "$PIDS_DIR" 2>&1 | tee -a "$wrapper_log"
+        else
+            debug "  Using strace + standard configuration"
+            strace -tt -f -o "$strace_file" \
+                sigul_bridge -c "$bridge_config" -v 2>&1 | tee -a "$wrapper_log"
+        fi
+
+        # Generate syscall summary if strace succeeded
+        if [[ -f "$strace_file" ]]; then
+            debug "Generating syscall summary from strace output"
+            {
+                echo "=== Syscall Summary (Top 20) ==="
+                echo "Generated at: $(date)"
+                echo ""
+                awk '/^[0-9]+.*[0-9]+:[0-9]+:[0-9]+/ {
+                    # Extract syscall name from strace line
+                    match($0, /[0-9]+:[0-9]+:[0-9]+\.[0-9]+ ([a-zA-Z_]+)/, arr)
+                    if (arr[1]) syscalls[arr[1]]++
+                } END {
+                    for (sc in syscalls) {
+                        printf "%6d %s\n", syscalls[sc], sc
+                    }
+                }' "$strace_file" | sort -nr | head -20
+                echo ""
+                echo "=== End Syscall Summary ==="
+            } > "$strace_summary_file"
+            chmod 644 "$strace_summary_file" 2>/dev/null || true
+        fi
+    else
+        # Standard execution without strace
+        if [[ $support_internal_flags -eq 1 ]]; then
+            debug "Using sigul_bridge with internal directory flags"
+            debug "  Using internal log dir: $LOGS_DIR/bridge"
+            debug "  Using internal pid dir: $PIDS_DIR"
+            sigul_bridge -c "$bridge_config" -v --internal-log-dir "$LOGS_DIR/bridge" --internal-pid-dir "$PIDS_DIR" 2>&1 | tee -a "$wrapper_log"
+        else
+            debug "Using sigul_bridge with standard configuration"
+            sigul_bridge -c "$bridge_config" -v 2>&1 | tee -a "$wrapper_log"
+        fi
+    fi
     bridge_rc=${PIPESTATUS[0]}
     set -e
     if [[ $bridge_rc -ne 0 ]]; then
+        # Capture first-failure diagnostic snapshot
+        capture_fatal_exit_snapshot "bridge" "$bridge_rc"
+
         end_time=$(date +%s)
         runtime=$(( end_time - start_time ))
         {
@@ -1902,16 +2388,19 @@ start_bridge() {
             echo "Attempting secondary strace (short) if available..."
         } > "$startup_err_file"
 
-        # Secondary short strace (best-effort)
-        if command -v strace >/dev/null 2>&1; then
-            strace -tt -f -o "$LOGS_DIR/bridge/strace.bridge.txt" \
-                sigul_bridge -c "$bridge_config" -v --internal-log-dir "$LOGS_DIR/bridge" --internal-pid-dir "$PIDS_DIR" >/dev/null 2>&1 || true
+        # Include strace information if it was captured during first attempt
+        if [[ -f "$strace_file" ]]; then
             {
+                echo "--- Strace Summary (from first attempt) ---"
+                cat "$strace_summary_file" 2>/dev/null || echo "No strace summary available"
+                echo ""
                 echo "--- Tail of strace.bridge.txt (last 60 lines) ---"
-                tail -60 "$LOGS_DIR/bridge/strace.bridge.txt" 2>/dev/null || echo "No strace output"
+                tail -60 "$strace_file" 2>/dev/null || echo "No strace output"
             } >> "$startup_err_file"
+        elif [[ "$use_strace" == "1" ]]; then
+            echo "strace was enabled but no trace file found" >> "$startup_err_file"
         else
-            echo "strace not installed; skipping syscall trace" >> "$startup_err_file"
+            echo "strace not enabled (set SIGUL_ENABLE_STRACE=1 to enable)" >> "$startup_err_file"
         fi
 
         # If wrapper log ended up empty, note that explicitly
@@ -1927,9 +2416,11 @@ start_bridge() {
         cat "$startup_err_file" 2>/dev/null || echo "Cannot read startup_err_file" >&2
         echo "---- wrapper stdout tail (80) ----" >&2
         tail -80 "$wrapper_log" 2>/dev/null || echo "No wrapper log content" >&2
-        if [[ -f "$LOGS_DIR/bridge/strace.bridge.txt" ]]; then
+        if [[ -f "$strace_file" ]]; then
+            echo "---- strace summary ----" >&2
+            cat "$strace_summary_file" 2>/dev/null || echo "No strace summary" >&2
             echo "---- strace tail (60) ----" >&2
-            tail -60 "$LOGS_DIR/bridge/strace.bridge.txt" 2>/dev/null || true
+            tail -60 "$strace_file" 2>/dev/null || echo "No strace output" >&2
         fi
         echo "==== END BRIDGE STARTUP FAIL DUMP ====" >&2
 
@@ -1938,8 +2429,8 @@ start_bridge() {
             echo "DEBUG mode: sleeping 600s for inspection" >> "$startup_err_file"
             sleep 600
         else
-            # Short pause so external scripts can extract logs before restart
-            sleep 30
+            # Reduced pause for faster CI feedback while allowing log extraction
+            sleep 3
         fi
         exit "$bridge_rc"
     fi
@@ -2021,6 +2512,142 @@ monitor_service() {
 
         sleep "$check_interval"
     done
+}
+
+# Verify bridge is reachable before server startup
+verify_bridge_reachability() {
+    log "Verifying bridge reachability before server startup..."
+
+    local bridge_hostname="${SIGUL_BRIDGE_HOSTNAME:-sigul-bridge}"
+    local bridge_port="${SIGUL_BRIDGE_CLIENT_PORT:-44334}"
+    local max_attempts=30
+    local attempt=1
+
+    debug "Checking bridge connectivity: $bridge_hostname:$bridge_port"
+
+    while [[ $attempt -le $max_attempts ]]; do
+        debug "Bridge dependency check attempt $attempt/$max_attempts..."
+
+        # Test if bridge port is accessible
+        if nc -z "$bridge_hostname" "$bridge_port" 2>/dev/null; then
+            log "✅ Bridge is reachable at $bridge_hostname:$bridge_port"
+            return 0
+        fi
+
+        # Show progress every 10 attempts
+        if [[ $((attempt % 10)) -eq 0 ]]; then
+            log "Still waiting for bridge to become reachable... (attempt $attempt/$max_attempts)"
+        fi
+
+        sleep 2
+        ((attempt++))
+    done
+
+    error "❌ Bridge is not reachable after $max_attempts attempts"
+    # shellcheck disable=SC2317  # This code is reachable via error condition
+    error "Server cannot start without bridge connectivity"
+    return 1
+}
+
+# First-failure diagnostic snapshot capture
+capture_fatal_exit_snapshot() {
+    local component="$1"
+    local exit_code="$2"
+    local artifacts_dir="${PROJECT_ROOT:-/tmp}/test-artifacts"
+
+    # Only capture on first failure - check if snapshot already exists
+    local snapshot_file="$artifacts_dir/fatal_exit_snapshot.txt"
+    if [[ -f "$snapshot_file" ]]; then
+        debug "Fatal exit snapshot already exists, skipping duplicate capture"
+        return 0
+    fi
+
+    log "Capturing first-failure diagnostic snapshot for $component (exit code: $exit_code)"
+
+    # Ensure artifacts directory exists
+    mkdir -p "$artifacts_dir"
+
+    # Capture comprehensive diagnostic information
+    {
+        echo "=== Sigul Fatal Exit Snapshot ==="
+        echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "Component: $component"
+        echo "Exit Code: $exit_code"
+        echo "PID: $$"
+        echo "PPID: $PPID"
+        echo ""
+
+        echo "=== System Information ==="
+        uname -a 2>/dev/null || echo "uname failed"
+        echo ""
+
+        echo "=== Environment Variables (Filtered) ==="
+        env | grep -E '^(SIGUL_|NSS_|DEBUG|HOME|PATH|USER|PWD)' | sort || echo "env filtering failed"
+        echo ""
+
+        echo "=== Certificate Listings ==="
+        if [[ -d "$SIGUL_BASE_DIR/secrets/certificates" ]]; then
+            echo "Certificate directory contents:"
+            ls -la "$SIGUL_BASE_DIR/secrets/certificates/" 2>/dev/null || echo "Cannot list certificates"
+            echo ""
+
+            echo "Certificate validity checks:"
+            for cert_file in "$SIGUL_BASE_DIR/secrets/certificates"/*.crt; do
+                if [[ -f "$cert_file" ]]; then
+                    echo "Certificate: $(basename "$cert_file")"
+                    openssl x509 -in "$cert_file" -noout -dates -subject 2>/dev/null || echo "Cannot read certificate"
+                    echo ""
+                fi
+            done
+        else
+            echo "Certificate directory not found"
+            echo ""
+        fi
+
+        echo "=== NSS Database Listings ==="
+        if [[ -d "$SIGUL_BASE_DIR/nss/$component" ]]; then
+            echo "NSS directory contents:"
+            ls -la "$SIGUL_BASE_DIR/nss/$component/" 2>/dev/null || echo "Cannot list NSS directory"
+            echo ""
+
+            # Try to list NSS certificates if certutil is available
+            if command -v certutil >/dev/null 2>&1 && [[ -f "$SIGUL_BASE_DIR/secrets/nss_password" ]]; then
+                echo "NSS certificate database contents:"
+                certutil -L -d "$SIGUL_BASE_DIR/nss/$component" 2>/dev/null || echo "Cannot list NSS certificates"
+                echo ""
+            fi
+        else
+            echo "NSS directory not found for $component"
+            echo ""
+        fi
+
+        echo "=== Recent Wrapper Log (Last 200 lines) ==="
+        local wrapper_log="$LOGS_DIR/$component/daemon.stdout.log"
+        if [[ -f "$wrapper_log" ]]; then
+            echo "From: $wrapper_log"
+            tail -200 "$wrapper_log" 2>/dev/null || echo "Cannot read wrapper log"
+        else
+            echo "Wrapper log not found: $wrapper_log"
+        fi
+        echo ""
+
+        echo "=== Process Information ==="
+        echo "Current processes:"
+        pgrep -f "(sigul|$component)" >/dev/null && pgrep -af "(sigul|$component)" || echo "Cannot list processes"
+        echo ""
+
+        echo "=== Directory Permissions ==="
+        ls -la "$SIGUL_BASE_DIR" 2>/dev/null || echo "Cannot list base directory"
+        echo ""
+
+        echo "=== End of Fatal Exit Snapshot ==="
+
+    } > "$snapshot_file" 2>&1
+
+    # Ensure snapshot is world-readable for reliable retrieval
+    chmod 644 "$snapshot_file" 2>/dev/null || true
+
+    log "Fatal exit snapshot saved: $snapshot_file"
 }
 
 #######################################

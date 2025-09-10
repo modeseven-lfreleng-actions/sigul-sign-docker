@@ -116,6 +116,66 @@ services:
     # Initialize client using unified approach
     command: ["/usr/local/bin/sigul-init.sh", "--role", "client"]
 
+  # Bridge Monitor Sidecar (Passive Monitor v2)
+  bridge-monitor:
+    image: alpine:3.19
+    container_name: sigul-bridge-monitor
+    hostname: bridge-monitor
+    user: "1000:1000"
+    environment:
+      MONITOR_TARGET: bridge
+      MONITOR_INTERVAL: 30
+      MONITOR_OUTPUT_DIR: /monitor/heartbeats
+      SIGUL_CONTAINER_NAME: sigul-bridge
+      DEBUG: ${DEBUG:-false}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./scripts:/scripts:ro
+      - sigul_monitor_data:/monitor
+    networks:
+      - sigul-network
+    profiles:
+      - monitoring
+    restart: unless-stopped
+    depends_on:
+      - sigul-bridge
+    command: |
+      sh -c "
+        apk add --no-cache jq netcat-openbsd curl
+        chmod +x /scripts/sigul-monitor.sh
+        exec /scripts/sigul-monitor.sh --target bridge --debug
+      "
+
+  # Server Monitor Sidecar (Passive Monitor v2)
+  server-monitor:
+    image: alpine:3.19
+    container_name: sigul-server-monitor
+    hostname: server-monitor
+    user: "1000:1000"
+    environment:
+      MONITOR_TARGET: server
+      MONITOR_INTERVAL: 30
+      MONITOR_OUTPUT_DIR: /monitor/heartbeats
+      SIGUL_CONTAINER_NAME: sigul-server
+      DEBUG: ${DEBUG:-false}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./scripts:/scripts:ro
+      - sigul_monitor_data:/monitor
+    networks:
+      - sigul-network
+    profiles:
+      - monitoring
+    restart: unless-stopped
+    depends_on:
+      - sigul-server
+    command: |
+      sh -c "
+        apk add --no-cache jq netcat-openbsd curl
+        chmod +x /scripts/sigul-monitor.sh
+        exec /scripts/sigul-monitor.sh --target server --debug
+      "
+
   # Sigul Infrastructure Health Monitor
   health-monitor:
     image: >-
@@ -259,6 +319,10 @@ volumes:
 
   # Sigul Client unified data directory (/var/sigul) for testing
   sigul_client_data:
+    driver: local
+
+  # Monitor data directory for heartbeat files
+  sigul_monitor_data:
     driver: local
 
 networks:

@@ -23,6 +23,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 COMPOSE_FILE="${PROJECT_ROOT}/docker-compose.sigul.yml"
 
+# Load health library
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/health.sh"
+
 # Default options
 VERBOSE_MODE=false
 DEBUG_MODE=false
@@ -151,6 +155,345 @@ parse_args() {
     done
 }
 
+# Initialize bridge readiness tracking
+initialize_bridge_readiness_tracking() {
+    local artifacts_dir="${PROJECT_ROOT}/test-artifacts"
+    mkdir -p "${artifacts_dir}"
+
+    # Initialize readiness tracking file
+    local readiness_file="${artifacts_dir}/bridge-readiness.json"
+    cat > "$readiness_file" << EOF
+{
+    "state": "initializing",
+    "attempts": 0,
+    "continuous_uptime_secs": 0,
+    "restart_count_at_verdict": 0,
+    "last_check_time": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+    "checks_history": []
+}
+EOF
+    chmod 644 "$readiness_file"
+    debug "Bridge readiness tracking initialized: $readiness_file"
+}
+
+# Check bridge port and internal socket connectivity with structured output
+check_bridge_connectivity() {
+    local check_result
+    check_result='{
+        "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'",
+        "external_port_ok": false,
+        "internal_socket_ok": false,
+        "container_running": false,
+        "details": {}
+    }'
+
+    # Check if container is running
+    local container_status
+    container_status=$(docker container inspect sigul-bridge --format '{{.State.Status}}' 2>/dev/null || echo "not found")
+
+    if [[ "$container_status" == "running" ]]; then
+        check_result=$(echo "$check_result" | jq '.container_running = true')
+
+        # Check external port connectivity
+        if nc -z localhost 44334 2>/dev/null; then
+            check_result=$(echo "$check_result" | jq '.external_port_ok = true')
+        fi
+
+        # Check internal socket connectivity using ss inside container
+        local internal_check
+        if internal_check=$(docker exec sigul-bridge ss -tlnp | grep ":44334" 2>/dev/null); then
+            check_result=$(echo "$check_result" | jq '.internal_socket_ok = true')
+            check_result=$(echo "$check_result" | jq --arg details "$internal_check" '.details.socket_info = $details')
+        fi
+    else
+        check_result=$(echo "$check_result" | jq --arg status "$container_status" '.details.container_status = $status')
+    fi
+
+    echo "$check_result"
+}
+
+# Perform sustained bridge readiness check with grace period
+perform_sustained_bridge_readiness_check() {
+    local artifacts_dir="${PROJECT_ROOT}/test-artifacts"
+    local readiness_file="${artifacts_dir}/bridge-readiness.json"
+    local required_consecutive_checks=3
+    local check_interval=3
+    local consecutive_success_count=0
+    local total_attempts=0
+    local start_time
+    start_time=$(date +%s)
+
+    debug "Starting sustained bridge readiness check (need $required_consecutive_checks consecutive successes)"
+
+    while [[ $consecutive_success_count -lt $required_consecutive_checks ]]; do
+        ((total_attempts++))
+
+        # Perform connectivity check
+        local check_result
+        check_result=$(check_bridge_connectivity)
+
+        local external_ok internal_ok container_running
+        external_ok=$(echo "$check_result" | jq -r '.external_port_ok')
+        internal_ok=$(echo "$check_result" | jq -r '.internal_socket_ok')
+        container_running=$(echo "$check_result" | jq -r '.container_running')
+
+        # Update readiness file with current status
+        local current_time
+        current_time=$(date +%s)
+        local uptime=$((current_time - start_time))
+
+        # Add check to history and update status
+        local updated_status
+        if [[ "$external_ok" == "true" && "$internal_ok" == "true" && "$container_running" == "true" ]]; then
+            ((consecutive_success_count++))
+            updated_status=$(jq --argjson check "$check_result" \
+                --arg state "checking" \
+                --argjson attempts "$total_attempts" \
+                --argjson uptime "$uptime" \
+                --argjson consecutive "$consecutive_success_count" \
+                '.state = $state | .attempts = $attempts | .continuous_uptime_secs = $uptime | .consecutive_successes = $consecutive | .checks_history += [$check] | .last_check_time = $check.timestamp' \
+                "$readiness_file")
+            debug "Bridge check $total_attempts: SUCCESS (consecutive: $consecutive_success_count/$required_consecutive_checks)"
+        else
+            consecutive_success_count=0  # Reset counter on any failure
+            updated_status=$(jq --argjson check "$check_result" \
+                --arg state "not_ready" \
+                --argjson attempts "$total_attempts" \
+                --argjson uptime "$uptime" \
+                '.state = $state | .attempts = $attempts | .continuous_uptime_secs = $uptime | .consecutive_successes = 0 | .checks_history += [$check] | .last_check_time = $check.timestamp' \
+                "$readiness_file")
+            debug "Bridge check $total_attempts: FAILED (external: $external_ok, internal: $internal_ok, running: $container_running) - resetting counter"
+        fi
+
+        echo "$updated_status" > "$readiness_file"
+
+        # Don't sleep after the last successful check
+        if [[ $consecutive_success_count -lt $required_consecutive_checks ]]; then
+            sleep $check_interval
+        fi
+    done
+
+    # Mark as ready in the JSON file
+    local final_status
+    final_status=$(jq '.state = "ready" | .final_verdict_time = "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"' "$readiness_file")
+    echo "$final_status" > "$readiness_file"
+
+    debug "Bridge sustained readiness achieved after $total_attempts attempts"
+    return 0
+}
+
+# Generate unified infrastructure status JSON
+generate_infrastructure_status() {
+    local artifacts_dir="${PROJECT_ROOT}/test-artifacts"
+    local status_file="$artifacts_dir/infrastructure-status.json"
+
+    log "Generating unified infrastructure status JSON using health library"
+
+    # Ensure artifacts directory exists
+    mkdir -p "$artifacts_dir"
+
+    # Use health library for comprehensive checks
+    local bridge_health server_health
+    bridge_health=$(check_component_health "bridge")
+    server_health=$(check_component_health "server")
+
+    # Extract key information using health library data
+    local bridge_status bridge_restart_count bridge_exit_code bridge_port_ok
+    bridge_status=$(echo "$bridge_health" | jq -r '.containerStatus.status')
+    bridge_restart_count=$(echo "$bridge_health" | jq -r '.containerStatus.restartCount')
+    bridge_exit_code=$(echo "$bridge_health" | jq -r '.containerStatus.exitCode')
+
+    # Check port status from health data
+    local bridge_port_status
+    bridge_port_status=$(echo "$bridge_health" | jq -r '.portStatus.reachable // false')
+    if [[ "$bridge_port_status" == "true" ]]; then
+        bridge_port_ok="true"
+    else
+        bridge_port_ok="false"
+    fi
+
+    # Collect server status from health data
+    local server_status server_restart_count server_exit_code
+    server_status=$(echo "$server_health" | jq -r '.containerStatus.status')
+    server_restart_count=$(echo "$server_health" | jq -r '.containerStatus.restartCount')
+    server_exit_code=$(echo "$server_health" | jq -r '.containerStatus.exitCode')
+
+    # Extract NSS information from health library data
+    local bridge_nss_nicknames bridge_nss_missing
+    local server_nss_nicknames server_nss_missing
+
+    if [[ "$bridge_status" == "running" ]]; then
+        bridge_nss_nicknames=$(echo "$bridge_health" | jq '.nssMetadata.certificates // []')
+        bridge_nss_missing=$(echo "$bridge_health" | jq '.nssMetadata.missingCertificates // []')
+    else
+        bridge_nss_nicknames='[]'
+        bridge_nss_missing='["sigul-bridge-cert"]'
+    fi
+
+    if [[ "$server_status" == "running" ]]; then
+        server_nss_nicknames=$(echo "$server_health" | jq '.nssMetadata.certificates // []')
+        server_nss_missing=$(echo "$server_health" | jq '.nssMetadata.missingCertificates // []')
+    else
+        server_nss_nicknames='[]'
+        server_nss_missing='["sigul-server-cert"]'
+    fi
+
+    # Check certificate files for bridge
+    local bridge_certs='{}'
+    if [[ "$bridge_status" == "running" ]]; then
+        local bridge_cert_ca bridge_cert_cert bridge_cert_key
+        if docker exec sigul-bridge test -f /var/sigul/secrets/certificates/ca.crt 2>/dev/null; then
+            bridge_cert_ca='"ok"'
+        else
+            bridge_cert_ca='"missing"'
+        fi
+        if docker exec sigul-bridge test -f /var/sigul/secrets/certificates/bridge.crt 2>/dev/null; then
+            bridge_cert_cert='"ok"'
+        else
+            bridge_cert_cert='"missing"'
+        fi
+        if docker exec sigul-bridge test -f /var/sigul/secrets/certificates/bridge-key.pem 2>/dev/null; then
+            bridge_cert_key='"ok"'
+        else
+            bridge_cert_key='"missing"'
+        fi
+        bridge_certs=$(jq -n --arg ca "$bridge_cert_ca" --arg cert "$bridge_cert_cert" --arg key "$bridge_cert_key" '{
+            "ca.crt": ($ca | fromjson),
+            "bridge.crt": ($cert | fromjson),
+            "bridge-key.pem": ($key | fromjson)
+        }')
+    fi
+
+    # Check certificate files for server
+    local server_certs='{}'
+    if [[ "$server_status" == "running" ]]; then
+        local server_cert_ca server_cert_cert server_cert_key
+        if docker exec sigul-server test -f /var/sigul/secrets/certificates/ca.crt 2>/dev/null; then
+            server_cert_ca='"ok"'
+        else
+            server_cert_ca='"missing"'
+        fi
+        if docker exec sigul-server test -f /var/sigul/secrets/certificates/server.crt 2>/dev/null; then
+            server_cert_cert='"ok"'
+        else
+            server_cert_cert='"missing"'
+        fi
+        if docker exec sigul-server test -f /var/sigul/secrets/certificates/server-key.pem 2>/dev/null; then
+            server_cert_key='"ok"'
+        else
+            server_cert_key='"missing"'
+        fi
+        server_certs=$(jq -n --arg ca "$server_cert_ca" --arg cert "$server_cert_cert" --arg key "$server_cert_key" '{
+            "ca.crt": ($ca | fromjson),
+            "server.crt": ($cert | fromjson),
+            "server-key.pem": ($key | fromjson)
+        }')
+    fi
+
+    # Check for last failure information
+    local bridge_last_failure server_last_failure
+    local fatal_snapshot="$artifacts_dir/fatal_exit_snapshot.txt"
+    if [[ -f "$fatal_snapshot" ]]; then
+        local snapshot_component snapshot_timestamp
+        snapshot_component=$(grep "^Component:" "$fatal_snapshot" | cut -d' ' -f2 2>/dev/null || echo "unknown")
+        snapshot_timestamp=$(grep "^Timestamp:" "$fatal_snapshot" | cut -d' ' -f2- 2>/dev/null || echo "unknown")
+        local snapshot_exit_code
+        snapshot_exit_code=$(grep "^Exit Code:" "$fatal_snapshot" | cut -d' ' -f3 2>/dev/null || echo "unknown")
+
+        if [[ "$snapshot_component" == "bridge" ]]; then
+            bridge_last_failure=$(jq -n --arg ec "$snapshot_exit_code" --arg ts "$snapshot_timestamp" --arg df "fatal_exit_snapshot.txt" '{
+                "exitCode": ($ec | tonumber? // $ec),
+                "timestamp": $ts,
+                "diagnosticFile": $df
+            }')
+        elif [[ "$snapshot_component" == "server" ]]; then
+            server_last_failure=$(jq -n --arg ec "$snapshot_exit_code" --arg ts "$snapshot_timestamp" --arg df "fatal_exit_snapshot.txt" '{
+                "exitCode": ($ec | tonumber? // $ec),
+                "timestamp": $ts,
+                "diagnosticFile": $df
+            }')
+        fi
+    fi
+
+    # Set defaults for last failure if not found
+    bridge_last_failure=${bridge_last_failure:-'null'}
+    server_last_failure=${server_last_failure:-'null'}
+
+    # Determine overall health using degraded mode classification
+    local bridge_health_status server_health_status overall_health_status all_healthy
+    bridge_health_status=$(echo "$bridge_health" | jq -r '.overallHealth')
+    server_health_status=$(echo "$server_health" | jq -r '.overallHealth')
+
+    # Determine combined health status
+    if [[ "$bridge_health_status" == "healthy" && "$server_health_status" == "healthy" ]]; then
+        overall_health_status="healthy"
+        all_healthy="true"
+    elif [[ "$bridge_health_status" == "crashed" || "$server_health_status" == "crashed" ]]; then
+        overall_health_status="crashed"
+        all_healthy="false"
+    elif [[ "$bridge_health_status" == "unreachable" || "$server_health_status" == "unreachable" ]]; then
+        overall_health_status="unreachable"
+        all_healthy="false"
+    else
+        # shellcheck disable=SC2034
+        overall_health_status="degraded"
+        all_healthy="false"
+    fi
+
+    # Generate unified JSON
+    local unified_status
+    unified_status=$(jq -n \
+        --arg bridge_status "$bridge_status" \
+        --argjson bridge_restart_count "$bridge_restart_count" \
+        --argjson bridge_port_ok "$bridge_port_ok" \
+        --argjson bridge_nss_nicknames "$bridge_nss_nicknames" \
+        --argjson bridge_nss_missing "$bridge_nss_missing" \
+        --argjson bridge_certs "$bridge_certs" \
+        --argjson bridge_last_failure "$bridge_last_failure" \
+        --arg server_status "$server_status" \
+        --argjson server_restart_count "$server_restart_count" \
+        --argjson server_nss_nicknames "$server_nss_nicknames" \
+        --argjson server_nss_missing "$server_nss_missing" \
+        --argjson server_certs "$server_certs" \
+        --argjson server_last_failure "$server_last_failure" \
+        --argjson all_healthy "$all_healthy" \
+        '{
+            "bridge": {
+                "status": $bridge_status,
+                "restartCount": $bridge_restart_count,
+                "port44334": $bridge_port_ok,
+                "nss": {
+                    "nicknames": $bridge_nss_nicknames,
+                    "missing": $bridge_nss_missing
+                },
+                "certs": $bridge_certs,
+                "lastFailure": $bridge_last_failure
+            },
+            "server": {
+                "status": $server_status,
+                "restartCount": $server_restart_count,
+                "nss": {
+                    "nicknames": $server_nss_nicknames,
+                    "missing": $server_nss_missing
+                },
+                "certs": $server_certs,
+                "lastFailure": $server_last_failure
+            },
+            "summary": {
+                "allHealthy": $all_healthy,
+                "overallHealthStatus": $overall_health_status,
+                "generatedAt": (now | todate)
+            }
+        }')
+
+    # Write the unified status file
+    echo "$unified_status" > "$status_file"
+    chmod 644 "$status_file" 2>/dev/null || true
+
+    debug "Infrastructure status JSON generated: $status_file"
+    return 0
+}
+
 # Enhanced environment analysis
 analyze_environment() {
     log "Analyzing deployment environment..."
@@ -189,7 +532,7 @@ check_prerequisites() {
     local missing_tools=()
 
     # Check for required tools
-    for tool in docker nc; do
+    for tool in docker nc jq; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing_tools+=("$tool")
         else
@@ -501,6 +844,9 @@ deploy_sigul_services() {
     echo "$ephemeral_admin_password" > "${PROJECT_ROOT}/test-artifacts/admin-password"
     chmod 600 "${PROJECT_ROOT}/test-artifacts/admin-password"
 
+    # Initialize bridge readiness tracking
+    initialize_bridge_readiness_tracking
+
     verbose "Deploying Sigul services for platform: $platform_id"
     verbose "Using server image: ${SIGUL_SERVER_IMAGE}"
     verbose "Using bridge image: ${SIGUL_BRIDGE_IMAGE}"
@@ -737,12 +1083,18 @@ deploy_sigul_services() {
 
             return 1
         elif [[ "$bridge_status" == "running" ]]; then
-            # Test port connectivity
+            # Perform provisional connectivity check
             if nc -z localhost 44334 2>/dev/null; then
-                success "✅ Sigul bridge is responsive on port 44334"
-                break
+                verbose "🔄 Bridge provisional OK (awaiting sustained readiness)"
+                # Now perform the sustained readiness check
+                if perform_sustained_bridge_readiness_check; then
+                    success "✅ Sigul bridge is durably ready after sustained validation"
+                    break
+                else
+                    debug "Bridge failed sustained readiness validation"
+                fi
             else
-                debug "Port 44334 not yet accessible"
+                debug "Bridge not yet responding on port 44334"
             fi
         fi
 
@@ -891,7 +1243,7 @@ verify_infrastructure() {
             # Container is running, now check if it's listening on the port
             if docker exec sigul-bridge ss -tlun | grep -q ":44334" 2>/dev/null; then
                 bridge_ready=true
-                success "✅ Bridge is listening and ready for connections (attempt $attempt)"
+                verbose "🔄 Bridge is listening on port 44334 (provisional - final validation pending)"
                 break
             else
                 debug "Bridge not yet listening on port 44334, waiting ${retry_interval} seconds..."
@@ -939,35 +1291,48 @@ verify_infrastructure() {
             # Always attempt to extract logs from the persistent volume for deeper diagnostics,
             # even if the container already restarted and lost its stdout/stderr context.
             debug "Extracting bridge logs from persistent volume (if present)..."
-            docker run --rm -v sigul_bridge_data:/var/sigul alpine:3.19 sh -c '
-              set -e
-              echo "===== Bridge Log Directory Listing ====="
-              ls -l /var/sigul/logs/bridge 2>/dev/null || echo "Cannot list /var/sigul/logs/bridge"
-              echo
-              for f in /var/sigul/logs/bridge/daemon.log \
-                       /var/sigul/logs/bridge/daemon.stdout.log \
-                       /var/sigul/logs/bridge/startup_errors.log; do
-                if [ -f "$f" ]; then
-                  echo "----- $f -----"
-                  if [ "$(basename "$f")" = "startup_errors.log" ]; then
-                    size=$(wc -c < "$f" 2>/dev/null || echo 0)
-                    if [ "$size" -le 20000 ]; then
-                      cat "$f" || true
-                    else
-                      echo "(File larger than 20KB, showing last 200 lines)"
-                      tail -200 "$f" || true
-                    fi
-                  else
-                    tail -120 "$f" || true
-                  fi
+
+            # Dynamically determine the actual bridge volume name
+            local bridge_volume_name=""
+            bridge_volume_name=$(docker inspect sigul-bridge --format '{{range .Mounts}}{{if eq .Destination "/var/sigul"}}{{.Name}}{{end}}{{end}}' 2>/dev/null || echo "")
+
+            if [[ -z "$bridge_volume_name" ]]; then
+                error "Could not determine bridge container volume name, listing all volumes for diagnosis:"
+                docker volume ls || true
+                error "Cannot extract bridge logs from volume - volume name resolution failed"
+                return 1
+            else
+                debug "Using bridge data volume: $bridge_volume_name"
+                docker run --rm -v "${bridge_volume_name}":/var/sigul alpine:3.19 sh -c '
+                  set -e
+                  echo "===== Bridge Log Directory Listing ====="
+                  ls -l /var/sigul/logs/bridge 2>/dev/null || echo "Cannot list /var/sigul/logs/bridge"
                   echo
-                fi
-              done
-              if [ -f /var/sigul/logs/bridge/strace.bridge.txt ]; then
-                echo "----- /var/sigul/logs/bridge/strace.bridge.txt (tail 120) -----"
-                tail -120 /var/sigul/logs/bridge/strace.bridge.txt || true
-              fi
-            ' 2>/dev/null || true
+                  for f in /var/sigul/logs/bridge/daemon.log \
+                           /var/sigul/logs/bridge/daemon.stdout.log \
+                           /var/sigul/logs/bridge/startup_errors.log; do
+                    if [ -f "$f" ]; then
+                      echo "----- $f -----"
+                      if [ "$(basename "$f")" = "startup_errors.log" ]; then
+                        size=$(wc -c < "$f" 2>/dev/null || echo 0)
+                        if [ "$size" -le 20000 ]; then
+                          cat "$f" || true
+                        else
+                          echo "(File larger than 20KB, showing last 200 lines)"
+                          tail -200 "$f" || true
+                        fi
+                      else
+                        tail -120 "$f" || true
+                      fi
+                      echo
+                    fi
+                  done
+                  if [ -f /var/sigul/logs/bridge/strace.bridge.txt ]; then
+                    echo "----- /var/sigul/logs/bridge/strace.bridge.txt (tail 120) -----"
+                    tail -120 /var/sigul/logs/bridge/strace.bridge.txt || true
+                  fi
+                ' 2>/dev/null || true
+            fi
 
             return 1
         fi
@@ -1050,6 +1415,34 @@ verify_infrastructure() {
             return 1
         fi
 
+        # Generate final infrastructure status JSON
+        generate_infrastructure_status
+
+        # Use health-aware success message
+        local infrastructure_status
+        infrastructure_status=$(cat "${PROJECT_ROOT}/test-artifacts/infrastructure-status.json")
+        local overall_health
+        overall_health=$(echo "$infrastructure_status" | jq -r '.summary.overallHealthStatus')
+
+        case "$overall_health" in
+            "healthy")
+                success "✅ All infrastructure services verified and fully operational"
+                ;;
+            "degraded")
+                warn "⚠️  Infrastructure services operational but with issues (degraded mode)"
+                ;;
+            "unreachable")
+                error "🔌 Infrastructure services unreachable"
+                return 1
+                ;;
+            "crashed")
+                error "❌ Infrastructure services have crashed"
+                return 1
+                ;;
+            *)
+                warn "❓ Infrastructure services status unknown"
+                ;;
+        esac
         return 0
     else
         error "❌ Infrastructure health check failed: only $healthy_services/$total_services services are healthy"
