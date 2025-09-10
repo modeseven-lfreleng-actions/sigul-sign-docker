@@ -60,7 +60,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-    timeout-minutes: 15
+    timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:
@@ -215,7 +215,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-    timeout-minutes: 30
+    timeout-minutes: 5
     needs: build-containers
     strategy:
       fail-fast: false
@@ -489,7 +489,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-    timeout-minutes: 20
+    timeout-minutes: 5
     needs: [build-containers, client-mock-test]
     # Temporarily disable while debugging integration tests/stack
     if: false
@@ -674,7 +674,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-    timeout-minutes: 35
+    timeout-minutes: 7
     needs: build-containers
     strategy:
       fail-fast: false
@@ -990,7 +990,7 @@ jobs:
     runs-on: 'ubuntu-latest'
     permissions:
       contents: read
-    timeout-minutes: 5
+    timeout-minutes: 3
     needs: [sigul-stack-test]
     if: always()
     steps:
