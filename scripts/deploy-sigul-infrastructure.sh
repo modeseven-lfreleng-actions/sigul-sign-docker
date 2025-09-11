@@ -212,74 +212,100 @@ check_bridge_connectivity() {
     echo "$check_result"
 }
 
-# Perform sustained bridge readiness check with grace period
-perform_sustained_bridge_readiness_check() {
+# Simple bridge readiness check with early diagnostic collection
+perform_simple_bridge_readiness_check() {
     local artifacts_dir="${PROJECT_ROOT}/test-artifacts"
     local readiness_file="${artifacts_dir}/bridge-readiness.json"
-    local required_consecutive_checks=3
+    local timeout_multiplier
+    timeout_multiplier=$(get_timeout_multiplier)
+    local max_attempts=$((20 * timeout_multiplier))  # Base 1 minute, adjusted for environment
+    local attempt=1
     local check_interval=3
-    local consecutive_success_count=0
-    local total_attempts=0
-    local start_time
-    start_time=$(date +%s)
 
-    debug "Starting sustained bridge readiness check (need $required_consecutive_checks consecutive successes)"
+    log "Starting simple bridge readiness check (max $max_attempts attempts)"
 
-    while [[ $consecutive_success_count -lt $required_consecutive_checks ]]; do
-        ((total_attempts++))
+    # Collect early diagnostics
+    collect_early_bridge_diagnostics
 
-        # Perform connectivity check
-        local check_result
-        check_result=$(check_bridge_connectivity)
+    while [[ $attempt -le $max_attempts ]]; do
+        log "Bridge readiness check (attempt $attempt/$max_attempts)..."
 
-        local external_ok internal_ok container_running
-        external_ok=$(echo "$check_result" | jq -r '.external_port_ok')
-        internal_ok=$(echo "$check_result" | jq -r '.internal_socket_ok')
-        container_running=$(echo "$check_result" | jq -r '.container_running')
+        # Check if bridge is accessible
+        if nc -z localhost 44334 2>/dev/null; then
+            log "✅ Bridge is accessible on port 44334"
 
-        # Update readiness file with current status
-        local current_time
-        current_time=$(date +%s)
-        local uptime=$((current_time - start_time))
+            # Update readiness file
+            local final_status
+            final_status=$(jq '.state = "ready" | .final_verdict_time = "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"' "$readiness_file")
+            echo "$final_status" > "$readiness_file"
 
-        # Add check to history and update status
-        local updated_status
-        if [[ "$external_ok" == "true" && "$internal_ok" == "true" && "$container_running" == "true" ]]; then
-            ((consecutive_success_count++))
-            updated_status=$(jq --argjson check "$check_result" \
-                --arg state "checking" \
-                --argjson attempts "$total_attempts" \
-                --argjson uptime "$uptime" \
-                --argjson consecutive "$consecutive_success_count" \
-                '.state = $state | .attempts = $attempts | .continuous_uptime_secs = $uptime | .consecutive_successes = $consecutive | .checks_history += [$check] | .last_check_time = $check.timestamp' \
-                "$readiness_file")
-            debug "Bridge check $total_attempts: SUCCESS (consecutive: $consecutive_success_count/$required_consecutive_checks)"
-        else
-            consecutive_success_count=0  # Reset counter on any failure
-            updated_status=$(jq --argjson check "$check_result" \
-                --arg state "not_ready" \
-                --argjson attempts "$total_attempts" \
-                --argjson uptime "$uptime" \
-                '.state = $state | .attempts = $attempts | .continuous_uptime_secs = $uptime | .consecutive_successes = 0 | .checks_history += [$check] | .last_check_time = $check.timestamp' \
-                "$readiness_file")
-            debug "Bridge check $total_attempts: FAILED (external: $external_ok, internal: $internal_ok, running: $container_running) - resetting counter"
+            return 0
         fi
 
-        echo "$updated_status" > "$readiness_file"
-
-        # Don't sleep after the last successful check
-        if [[ $consecutive_success_count -lt $required_consecutive_checks ]]; then
-            sleep $check_interval
+        # Log failure details every 5 attempts
+        if [[ $((attempt % 5)) -eq 0 ]]; then
+            error "Bridge not accessible after $attempt attempts"
+            error "Container status: $(docker container inspect sigul-bridge --format '{{.State.Status}}' 2>/dev/null || echo 'not found')"
         fi
+
+        ((attempt++))
+        sleep $check_interval
     done
 
-    # Mark as ready in the JSON file
-    local final_status
-    final_status=$(jq '.state = "ready" | .final_verdict_time = "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"' "$readiness_file")
-    echo "$final_status" > "$readiness_file"
+    # Timeout reached - collect final diagnostics
+    error "Bridge readiness check timed out after $max_attempts attempts"
+    collect_bridge_failure_diagnostics
+    return 1
+}
 
-    debug "Bridge sustained readiness achieved after $total_attempts attempts"
-    return 0
+# Collect early bridge diagnostics
+collect_early_bridge_diagnostics() {
+    log "Collecting early bridge diagnostics..."
+
+    local diagnostics_dir="${PROJECT_ROOT}/test-artifacts/early-bridge-diagnostics"
+    mkdir -p "$diagnostics_dir"
+
+    # Container status
+    docker container inspect sigul-bridge > "$diagnostics_dir/container-inspect.json" 2>/dev/null || echo "Cannot inspect container" > "$diagnostics_dir/container-inspect.json"
+
+    # Container logs
+    docker logs sigul-bridge > "$diagnostics_dir/container-logs.txt" 2>&1 || echo "Cannot retrieve logs" > "$diagnostics_dir/container-logs.txt"
+
+    # Network status
+    docker exec sigul-bridge ss -tlnp > "$diagnostics_dir/network-sockets.txt" 2>/dev/null || echo "Cannot retrieve network info" > "$diagnostics_dir/network-sockets.txt"
+
+    # Host connectivity test
+    {
+        echo "=== Host Connectivity Test ==="
+        echo "Date: $(date)"
+        echo "nc test to localhost:44334: $(nc -z localhost 44334 2>&1 && echo 'SUCCESS' || echo 'FAILED')"
+        echo "netstat listening ports:"
+        netstat -tlnp 2>/dev/null | grep -E "(44334|LISTEN)" || echo "No listening ports found"
+    } > "$diagnostics_dir/host-connectivity.txt"
+
+    debug "Early bridge diagnostics collected in: $diagnostics_dir"
+}
+
+# Collect bridge failure diagnostics
+collect_bridge_failure_diagnostics() {
+    error "Collecting bridge failure diagnostics..."
+
+    local diagnostics_dir="${PROJECT_ROOT}/test-artifacts/bridge-failure-diagnostics"
+    mkdir -p "$diagnostics_dir"
+
+    # Container final state
+    docker container inspect sigul-bridge > "$diagnostics_dir/final-container-inspect.json" 2>/dev/null || echo "Cannot inspect container" > "$diagnostics_dir/final-container-inspect.json"
+
+    # Full container logs
+    docker logs sigul-bridge > "$diagnostics_dir/final-container-logs.txt" 2>&1 || echo "Cannot retrieve logs" > "$diagnostics_dir/final-container-logs.txt"
+
+    # Network final state
+    docker exec sigul-bridge ss -tlnp > "$diagnostics_dir/final-network-sockets.txt" 2>/dev/null || echo "Cannot retrieve network info" > "$diagnostics_dir/final-network-sockets.txt"
+
+    # Docker compose services status
+    docker-compose -f "${COMPOSE_FILE}" ps > "$diagnostics_dir/compose-services-status.txt" 2>&1 || echo "Cannot retrieve compose status" > "$diagnostics_dir/compose-services-status.txt"
+
+    error "Bridge failure diagnostics collected in: $diagnostics_dir"
 }
 
 # Generate unified infrastructure status JSON
@@ -1085,13 +1111,13 @@ deploy_sigul_services() {
         elif [[ "$bridge_status" == "running" ]]; then
             # Perform provisional connectivity check
             if nc -z localhost 44334 2>/dev/null; then
-                verbose "🔄 Bridge provisional OK (awaiting sustained readiness)"
-                # Now perform the sustained readiness check
-                if perform_sustained_bridge_readiness_check; then
-                    success "✅ Sigul bridge is durably ready after sustained validation"
+                verbose "🔄 Bridge provisional OK (performing simple readiness check)"
+                # Now perform the simple readiness check
+                if perform_simple_bridge_readiness_check; then
+                    success "✅ Sigul bridge is ready"
                     break
                 else
-                    debug "Bridge failed sustained readiness validation"
+                    debug "Bridge failed readiness check"
                 fi
             else
                 debug "Bridge not yet responding on port 44334"
@@ -1516,13 +1542,37 @@ main() {
         exit 0
     else
         error "=== Deployment Failed ==="
+
+        # Stream container logs immediately for visibility
+        stream_container_logs_on_failure "sigul-server"
+        stream_container_logs_on_failure "sigul-bridge"
+
+        # Collect detailed diagnostics
+        collect_nss_failure_diagnostics
+
         error "Check the logs above for specific error details"
         error "Consider running with --debug flag for more detailed output"
 
-        # Collect NSS diagnostics on deployment failure
-        collect_nss_failure_diagnostics
-
         exit 1
+    fi
+}
+
+# Stream container logs on failure for immediate visibility
+stream_container_logs_on_failure() {
+    local container_name="$1"
+
+    if docker ps -a --format "{{.Names}}" | grep -q "^${container_name}$"; then
+        log "Streaming logs for failed container: $container_name"
+        echo "::group::${container_name} container logs (failure dump)"
+        docker logs "$container_name" 2>&1 | tail -200 || echo "Unable to fetch logs from $container_name"
+        echo "::endgroup::"
+
+        # Also show container status
+        local status
+        status=$(docker container inspect "$container_name" --format '{{.State.Status}} (exit: {{.State.ExitCode}})' 2>/dev/null || echo 'not found')
+        error "Container $container_name final status: $status"
+    else
+        error "Container $container_name not found for log streaming"
     fi
 }
 

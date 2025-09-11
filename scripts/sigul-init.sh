@@ -296,8 +296,37 @@ setup_env() {
 }
 
 #######################################
-# Application Directory Functions
+# Phase 2.1: Directory Structure Setup
 #######################################
+
+# Normalize volume permissions to ensure consistent ownership
+normalize_volume_permissions() {
+    local base="/var/sigul"
+    debug "Normalizing volume ownership under $base"
+
+    # Only attempt if we're running as the sigul user (UID 1000)
+    if [[ "$(id -u)" == "1000" ]]; then
+        # Find files/dirs not owned by sigul (1000:1000) and fix them
+        # Use maxdepth to avoid deep recursion and focus on key areas
+        find "$base" -maxdepth 4 \( -type d -o -type f \) ! -user 1000 \
+            -exec chown 1000:1000 {} + 2>/dev/null || true
+
+        # Ensure key directories have proper permissions
+        if [[ -d "$base" ]]; then
+            chmod 755 "$base" 2>/dev/null || true
+        fi
+        if [[ -d "$base/secrets" ]]; then
+            chmod 700 "$base/secrets" 2>/dev/null || true
+        fi
+        if [[ -d "$base/nss" ]]; then
+            chmod 755 "$base/nss" 2>/dev/null || true
+        fi
+
+        debug "Volume permission normalization completed"
+    else
+        debug "Skipping permission normalization (not running as sigul user)"
+    fi
+}
 
 # Create complete /var/sigul directory structure
 setup_application_directory() {
@@ -676,6 +705,30 @@ setup_certificates() {
     local ca_cert="$SECRETS_DIR/certificates/ca.crt"
     generated_certs+=("$ca_cert")
 
+    # Validate certificates before NSS import
+    for cert_file in "${generated_certs[@]}"; do
+        if [[ -n "$cert_file" ]] && [[ -f "$cert_file" ]]; then
+            local cert_name
+            cert_name=$(basename "$cert_file" .crt)
+
+            # Skip validation for CA cert (self-signed)
+            if [[ "$cert_name" != "ca" ]]; then
+                if validate_component_certificate "$cert_file" "$ca_cert" "$SIGUL_ROLE"; then
+                    debug "Certificate validation passed: $cert_file"
+                    generate_cert_metadata_json "$cert_file" "$SIGUL_ROLE"
+                else
+                    error "Certificate validation failed: $cert_file"
+                    return 1
+                fi
+            else
+                generate_cert_metadata_json "$cert_file" "ca"
+            fi
+        fi
+    done
+
+    # Create unified certificate metadata summary
+    create_certificate_metadata_summary
+
     # Import certificates for NSS
     for cert_file in "${generated_certs[@]}"; do
         if [[ -n "$cert_file" ]] && [[ -f "$cert_file" ]]; then
@@ -762,6 +815,146 @@ generate_component_certificate() {
 
     log "Generated certificate: $cert_file"
     echo "$cert_file"
+}
+
+# Validate component certificate before NSS import
+validate_component_certificate() {
+    local cert="$1"
+    local ca="$2"
+    local role="$3"
+    local artifacts_dir="${PROJECT_ROOT:-/tmp}/test-artifacts"
+
+    debug "Validating certificate: $cert for role: $role"
+
+    # Ensure artifacts directory exists
+    mkdir -p "$artifacts_dir"
+
+    # Check certificate structure
+    if ! openssl x509 -in "$cert" -noout >/dev/null 2>&1; then
+        error "Invalid X.509 certificate structure: $cert"
+        return 1
+    fi
+
+    # Verify certificate chain
+    if ! openssl verify -CAfile "$ca" "$cert" >/dev/null 2>&1; then
+        error "Certificate failed chain verification: $cert"
+        return 1
+    fi
+
+    # Check Subject Alternative Name (warn but don't fail)
+    local san
+    san=$(openssl x509 -in "$cert" -noout -text | awk '/Subject Alternative Name/{flag=1;next}/X509v3/{flag=0}flag' || true)
+    if ! grep -qi "sigul-${role}" <<<"$san"; then
+        warn "SAN does not include expected role hostname: sigul-${role} (continuing in test mode)"
+    fi
+
+    debug "Certificate validation passed: $cert"
+    return 0
+}
+
+# Generate certificate metadata JSON artifact
+generate_cert_metadata_json() {
+    local cert="$1"
+    local role="$2"
+    local artifacts_dir="${PROJECT_ROOT:-/tmp}/test-artifacts"
+    local metadata_file="$artifacts_dir/cert-metadata-${role}.json"
+
+    debug "Generating certificate metadata for: $cert"
+
+    # Ensure artifacts directory exists
+    mkdir -p "$artifacts_dir"
+
+    if [[ ! -f "$cert" ]]; then
+        echo '{"error": "Certificate file not found", "validated": false}' > "$metadata_file"
+        return 1
+    fi
+
+    # Extract certificate information
+    local issuer subject san not_before not_after fingerprint
+    issuer=$(openssl x509 -in "$cert" -noout -issuer | sed 's/issuer=//' || echo "unknown")
+    subject=$(openssl x509 -in "$cert" -noout -subject | sed 's/subject=//' || echo "unknown")
+    san=$(openssl x509 -in "$cert" -noout -text | awk '/Subject Alternative Name/{flag=1;next}/X509v3/{flag=0}flag' | tr -d ' ' || echo "none")
+    not_before=$(openssl x509 -in "$cert" -noout -startdate | sed 's/notBefore=//' || echo "unknown")
+    not_after=$(openssl x509 -in "$cert" -noout -enddate | sed 's/notAfter=//' || echo "unknown")
+    fingerprint=$(openssl x509 -in "$cert" -noout -fingerprint -sha256 | sed 's/SHA256 Fingerprint=//' || echo "unknown")
+
+    # Check if certificate is still valid (not expired)
+    local validated="true"
+    if ! openssl x509 -in "$cert" -checkend 0 >/dev/null 2>&1; then
+        validated="false"
+    fi
+
+    # Generate JSON metadata
+    cat > "$metadata_file" << EOF
+{
+    "role": "$role",
+    "certificate_path": "$cert",
+    "issuer_cn": "$issuer",
+    "subject_cn": "$subject",
+    "san_list": "$san",
+    "not_before": "$not_before",
+    "not_after": "$not_after",
+    "fingerprint": "$fingerprint",
+    "validated": $validated,
+    "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+
+    debug "Certificate metadata written to: $metadata_file"
+}
+
+# Create unified certificate metadata summary
+create_certificate_metadata_summary() {
+    local artifacts_dir="${PROJECT_ROOT:-/tmp}/test-artifacts"
+    local summary_file="$artifacts_dir/cert-metadata.json"
+
+    debug "Creating unified certificate metadata summary"
+
+    # Ensure artifacts directory exists
+    mkdir -p "$artifacts_dir"
+
+    # Initialize summary structure
+    cat > "$summary_file" << EOF
+{
+    "certificate_summary": {
+        "role": "$SIGUL_ROLE",
+        "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+        "certificates": []
+    }
+}
+EOF
+
+    # Collect all individual cert metadata files
+    local cert_files=()
+    for metadata in "$artifacts_dir"/cert-metadata-*.json; do
+        if [[ -f "$metadata" ]]; then
+            cert_files+=("$metadata")
+        fi
+    done
+
+    if [[ ${#cert_files[@]} -gt 0 ]]; then
+        # Build certificates array
+        local certs_json="["
+        local first=true
+        for cert_file in "${cert_files[@]}"; do
+            if [[ "$first" == "true" ]]; then
+                first=false
+            else
+                certs_json+=","
+            fi
+            certs_json+=$(cat "$cert_file")
+        done
+        certs_json+="]"
+
+        # Update summary with certificates array
+        local updated_summary
+        updated_summary=$(jq --argjson certs "$certs_json" '.certificate_summary.certificates = $certs' "$summary_file")
+        echo "$updated_summary" > "$summary_file"
+
+        debug "Certificate metadata summary created: $summary_file (${#cert_files[@]} certificates)"
+    else
+        debug "No certificate metadata files found"
+    fi
 }
 
 #######################################
@@ -2803,7 +2996,10 @@ main() {
     # Phase 1.1: Core Infrastructure
     setup_env
 
-    # Phase 1.2: Application Directory Setup
+    # Phase 1.2: Volume Permission Normalization
+    normalize_volume_permissions
+
+    # Phase 1.3: Application Directory Setup
     setup_application_directory
     set_directory_permissions
     validate_directories
