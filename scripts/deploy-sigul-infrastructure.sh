@@ -598,15 +598,29 @@ check_prerequisites() {
     success "Prerequisites check passed"
 }
 
-
-
-
+# Detect platform based on system architecture
+detect_platform() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64)
+            echo "linux-amd64"
+            ;;
+        aarch64|arm64)
+            echo "linux-arm64"
+            ;;
+        *)
+            # Default fallback
+            echo "linux-amd64"
+            ;;
+    esac
+}
 
 # Load infrastructure images with enhanced validation
 load_infrastructure_images() {
     log "Loading pre-built infrastructure images with validation..."
 
-    local platform_id="${SIGUL_RUNNER_PLATFORM:-linux-amd64}"
+    local platform_id="${SIGUL_RUNNER_PLATFORM:-$(detect_platform)}"
     local loaded_images=()
     local failed_images=()
 
@@ -770,7 +784,7 @@ deploy_sigul_services() {
     compose_cmd=$(get_docker_compose_cmd)
 
     # Set environment variables for platform-specific images
-    local platform_id="${SIGUL_RUNNER_PLATFORM:-linux-amd64}"
+    local platform_id="${SIGUL_RUNNER_PLATFORM:-$(detect_platform)}"
     export SIGUL_SERVER_IMAGE="server-${platform_id}-image:test"
     export SIGUL_BRIDGE_IMAGE="bridge-${platform_id}-image:test"
     # SIGUL_CLIENT_IMAGE removed from infrastructure deployment (only needed for integration tests)
@@ -1318,7 +1332,7 @@ verify_infrastructure() {
         while [[ $attempt -le $max_attempts ]]; do
             debug "Connectivity check attempt $attempt/$max_attempts..."
 
-            if docker exec sigul-server ss -tun | grep -q ":44334" 2>/dev/null; then
+            if docker exec sigul-server ss -tun | grep -q ":44333" 2>/dev/null; then
                 connectivity_ok=true
                 success "✅ Inter-service network connectivity verified (server connected to bridge)"
                 break
