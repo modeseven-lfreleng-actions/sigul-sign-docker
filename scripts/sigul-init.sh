@@ -486,8 +486,8 @@ store_secret() {
 
     local secret_file="$SECRETS_DIR/${component_role}_${secret_name}"
 
-    # Write secret to file with secure permissions
-    echo "$secret_value" > "$secret_file"
+    # Write secret to file with secure permissions (no trailing newline)
+    printf '%s' "$secret_value" > "$secret_file"
     chmod 600 "$secret_file"
 
     return 0
@@ -525,14 +525,14 @@ generate_nss_password() {
         return 0
     fi
 
-    # Check environment variable
-    if [[ -n "${NSS_PASSWORD:-}" ]]; then
+    # Check environment variable - but ignore placeholder values
+    if [[ -n "${NSS_PASSWORD:-}" ]] && [[ "$NSS_PASSWORD" != *"auto_generated"* ]] && [[ "$NSS_PASSWORD" != *"ephemeral"* ]]; then
         store_secret "nss_password" "$NSS_PASSWORD"
         echo "$NSS_PASSWORD"
         return 0
     fi
 
-    # Generate new password
+    # Generate new password (either no env var or placeholder detected)
     local password
     password=$(generate_password "$NSS_PASSWORD_LENGTH")
 
@@ -555,14 +555,14 @@ generate_admin_password() {
         return 0
     fi
 
-    # Check environment variable
-    if [[ -n "${SIGUL_ADMIN_PASSWORD:-}" ]]; then
+    # Check environment variable - but ignore placeholder values
+    if [[ -n "${SIGUL_ADMIN_PASSWORD:-}" ]] && [[ "$SIGUL_ADMIN_PASSWORD" != *"auto_generated"* ]] && [[ "$SIGUL_ADMIN_PASSWORD" != *"ephemeral"* ]]; then
         store_secret "admin_password" "$SIGUL_ADMIN_PASSWORD"
         echo "$SIGUL_ADMIN_PASSWORD"
         return 0
     fi
 
-    # Generate new password
+    # Generate new password (either no env var or placeholder detected)
     local password
     password=$(generate_password "$ADMIN_PASSWORD_LENGTH")
 
@@ -966,6 +966,12 @@ create_nss_database() {
     local role="$1"
     local nss_dir="$SIGUL_BASE_DIR/nss/$role"
 
+    log "=== NSS DATABASE CREATION DEBUG START ==="
+    log "Function: create_nss_database"
+    log "Role: $role"
+    log "NSS directory: $nss_dir"
+    log "Current working directory: $(pwd)"
+    log "Call stack: ${FUNCNAME[*]}"
 
     debug "Creating NSS database for role: $role"
     debug "NSS directory: $nss_dir"
@@ -975,9 +981,16 @@ create_nss_database() {
         error "Failed to create NSS directory: $nss_dir"
     fi
 
+    # Check what files exist before creation
+    log "Files in NSS directory before creation check:"
+    ls -la "$nss_dir" 2>/dev/null || log "NSS directory is empty or doesn't exist"
+
     # Check if NSS database already exists
     if [[ -f "$nss_dir/cert9.db" ]] && [[ -f "$nss_dir/key4.db" ]] && [[ -f "$nss_dir/pkcs11.txt" ]]; then
         log "NSS database already exists for role: $role"
+        log "Existing files:"
+        ls -la "$nss_dir"/ 2>/dev/null
+        log "=== NSS DATABASE CREATION DEBUG END (ALREADY EXISTS) ==="
         return 0
     fi
 
@@ -989,6 +1002,9 @@ create_nss_database() {
 
     # Create NSS database
     log "Creating NSS database for role: $role"
+    log "Password length for NSS creation: $(printf '%s' "$nss_password" | wc -c)"
+    log "Password hexdump for NSS creation: $(printf '%s' "$nss_password" | hexdump -C)"
+
     if ! echo "$nss_password" | certutil -N -d "$nss_dir" -f /dev/stdin; then
         error "Failed to create NSS database for role: $role"
     fi
@@ -998,6 +1014,9 @@ create_nss_database() {
     chown sigul:sigul "$nss_dir"/*
 
     log "NSS database created successfully for role: $role"
+    log "Files created:"
+    ls -la "$nss_dir"/ 2>/dev/null
+    log "=== NSS DATABASE CREATION DEBUG END (NEWLY CREATED) ==="
     return 0
 }
 
@@ -1281,7 +1300,10 @@ validate_nss_database() {
 setup_nss_database() {
     local role="$SIGUL_ROLE"
 
+    log "=== SETUP NSS DATABASE PHASE START ==="
     log "Setting up NSS database for role: $role"
+    log "NSS base directory: $NSS_DIR"
+    log "Role-specific NSS directory: $NSS_DIR/$role"
 
     # Create NSS database
     if ! create_nss_database "$role"; then
@@ -1326,6 +1348,10 @@ perform_nss_integrity_deep_check() {
         error "Failed to load NSS password for deep integrity check"
         return 1
     fi
+
+    log "NSS INTEGRITY CHECK DEBUG:"
+    log "Password length: $(printf '%s' "$nss_password" | wc -c)"
+    log "Password hexdump: $(printf '%s' "$nss_password" | hexdump -C)"
 
     # Create comprehensive integrity report
     {
@@ -2993,6 +3019,10 @@ main() {
 
     log "Starting Sigul initialization v$VERSION"
 
+    # NSS Database Tracking - Before Phase 1
+    log "=== NSS DB TRACKING: Before Phase 1 ==="
+    find /var/sigul -name "*.db" -o -name "pkcs11.txt" 2>/dev/null | while read -r file; do log "Found NSS file: $file"; done || log "No NSS database files found"
+
     # Phase 1.1: Core Infrastructure
     setup_env
 
@@ -3007,11 +3037,23 @@ main() {
     log "Phase 1 initialization completed successfully for role: $SIGUL_ROLE"
     log "Application directory: $SIGUL_BASE_DIR"
 
+    # NSS Database Tracking - After Phase 1
+    log "=== NSS DB TRACKING: After Phase 1 ==="
+    find /var/sigul -name "*.db" -o -name "pkcs11.txt" 2>/dev/null | while read -r file; do log "Found NSS file: $file"; done || log "No NSS database files found"
+
     # Phase 2.1: Secrets Management
     setup_secrets
 
+    # NSS Database Tracking - Before Certificate Management
+    log "=== NSS DB TRACKING: Before Certificate Management ==="
+    find /var/sigul -name "*.db" -o -name "pkcs11.txt" 2>/dev/null | while read -r file; do log "Found NSS file: $file"; done || log "No NSS database files found"
+
     # Phase 2.2: Certificate Management
     setup_certificates
+
+    # NSS Database Tracking - After Certificate Management
+    log "=== NSS DB TRACKING: After Certificate Management ==="
+    find /var/sigul -name "*.db" -o -name "pkcs11.txt" 2>/dev/null | while read -r file; do log "Found NSS file: $file"; done || log "No NSS database files found"
 
     log "Phase 2 initialization completed successfully"
 

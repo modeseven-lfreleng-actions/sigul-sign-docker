@@ -865,10 +865,12 @@ deploy_sigul_services() {
 
     verbose "Generated ephemeral credentials for deployment"
 
-    # Store password for integration tests to use
+    # Store passwords for integration tests to use
     mkdir -p "${PROJECT_ROOT}/test-artifacts"
     echo "$ephemeral_admin_password" > "${PROJECT_ROOT}/test-artifacts/admin-password"
+    echo "$ephemeral_nss_password" > "${PROJECT_ROOT}/test-artifacts/nss-password"
     chmod 600 "${PROJECT_ROOT}/test-artifacts/admin-password"
+    chmod 600 "${PROJECT_ROOT}/test-artifacts/nss-password"
 
     # Initialize bridge readiness tracking
     initialize_bridge_readiness_tracking

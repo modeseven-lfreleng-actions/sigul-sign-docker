@@ -31,7 +31,7 @@ RUN dnf install -y --setopt=install_weak_deps=False --allowerasing \
         vim-minimal less findutils grep \
         curl wget rsync nmap-ncat \
         hostname iproute net-tools \
-        sqlite nss-tools && \
+        sqlite nss-tools jq && \
     dnf clean all
 
 # Copy and run installation script
