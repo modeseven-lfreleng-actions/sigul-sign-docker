@@ -44,6 +44,24 @@ readonly HEALTH_PURPLE='\033[0;35m'
 readonly HEALTH_NC='\033[0m' # No Color
 
 #######################################
+# Utility functions
+#######################################
+
+# Get timestamp in milliseconds (cross-platform)
+get_timestamp_ms() {
+    if command -v gdate >/dev/null 2>&1; then
+        # GNU date (available via homebrew on macOS)
+        gdate +%s%3N
+    elif date --version 2>/dev/null | grep -q GNU; then
+        # GNU date on Linux
+        date +%s%3N
+    else
+        # Fallback for macOS and other systems - use seconds * 1000
+        echo $(($(date +%s) * 1000))
+    fi
+}
+
+#######################################
 # Logging functions for health library
 #######################################
 
@@ -178,7 +196,7 @@ check_port() {
     local reachable="false"
     local error_message=""
 
-    start_time=$(date +%s%3N)
+    start_time=$(get_timestamp_ms)
 
     # Test connectivity with timeout
     if timeout "$timeout" nc -z "$hostname" "$port" 2>/dev/null; then
@@ -189,7 +207,7 @@ check_port() {
         health_debug "Port $hostname:$port is not reachable"
     fi
 
-    end_time=$(date +%s%3N)
+    end_time=$(get_timestamp_ms)
     response_time_ms=$((end_time - start_time))
 
     # Determine health status

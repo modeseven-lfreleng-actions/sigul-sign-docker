@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
@@ -707,7 +707,31 @@ load_infrastructure_images() {
     local loaded_images=()
     local failed_images=()
 
-    # Debug platform detection
+    # Check if we're running locally (no artifacts in /tmp)
+    if ! compgen -G "/tmp/*.tar" > /dev/null; then
+        log "Local mode detected - no .tar artifacts found in /tmp"
+        log "Assuming images are already built locally"
+
+        # Verify that the expected images exist locally
+        local expected_images=(
+            "${SIGUL_SERVER_IMAGE:-server-${platform_id}-image:test}"
+            "${SIGUL_BRIDGE_IMAGE:-bridge-${platform_id}-image:test}"
+        )
+
+        for image in "${expected_images[@]}"; do
+            if docker image inspect "$image" >/dev/null 2>&1; then
+                log "✅ Local image found: $image"
+            else
+                error "❌ Local image not found: $image"
+                return 1
+            fi
+        done
+
+        log "✅ All required local images are available"
+        return 0
+    fi
+
+    # Debug platform detection for artifact loading mode
     debug "Platform ID detection:"
     debug "  SIGUL_RUNNER_PLATFORM: '${SIGUL_RUNNER_PLATFORM:-unset}'"
     debug "  RUNNER_ARCH: '${RUNNER_ARCH:-unset}'"
@@ -718,17 +742,13 @@ load_infrastructure_images() {
             debug "    $(basename "$file")"
         fi
     done
-    if ! compgen -G "/tmp/*.tar" > /dev/null; then
-        debug "    (no .tar files found in /tmp)"
-    fi
 
     # Define image mappings based on build output naming convention
     # - Infrastructure builds create: /tmp/server-${platform_id}.tar, /tmp/bridge-${platform_id}.tar
     # - Client image loading removed from infrastructure deployment (only needed for integration tests)
-    declare -A image_mappings=(
-        ["server-${platform_id}-image:test"]="/tmp/server-${platform_id}.tar"
-        ["bridge-${platform_id}-image:test"]="/tmp/bridge-${platform_id}.tar"
-    )
+    declare -A image_mappings
+    image_mappings["server-${platform_id}-image:test"]="/tmp/server-${platform_id}.tar"
+    image_mappings["bridge-${platform_id}-image:test"]="/tmp/bridge-${platform_id}.tar"
 
     for target_image in "${!image_mappings[@]}"; do
         local artifact_file="${image_mappings[$target_image]}"
@@ -1378,6 +1398,8 @@ verify_infrastructure() {
         # Test actual connectivity: server connecting to bridge with retry logic
         log "Testing inter-service connectivity..."
         local connectivity_ok=false
+        local timeout_multiplier
+        timeout_multiplier=$(get_timeout_multiplier)
         # Extended timing for GitHub Actions environment
         if [[ "${GITHUB_ACTIONS:-false}" == "true" ]]; then
             local max_attempts=15
