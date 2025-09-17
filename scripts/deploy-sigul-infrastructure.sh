@@ -620,7 +620,7 @@ generate_configurations() {
 
 [server]
 bridge-hostname = sigul-bridge
-bridge-port = 44334
+bridge-port = 44333
 server-cert-nickname = sigul-server-cert
 max-file-payload-size = 2097152
 signing-timeout = 60
