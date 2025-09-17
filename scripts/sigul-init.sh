@@ -1691,8 +1691,6 @@ server-hostname = sigul-server
 bridge-cert-nickname = sigul-bridge-cert
 max-file-payload-size = 2097152
 idle-timeout = 300
-# NSS directory setting
-nss-dir = ${SIGUL_NSS_DIR}
 
 # SSL/TLS configuration
 ca-cert-file = ${SIGUL_BASE_DIR}/secrets/certificates/ca.crt
@@ -1760,12 +1758,14 @@ bridge-hostname = ${SIGUL_BRIDGE_HOSTNAME}
 bridge-port = ${SIGUL_BRIDGE_CLIENT_PORT}
 server-hostname = ${SIGUL_SERVER_HOST:-sigul-server}
 client-cert-nickname = sigul-client-cert
+username = integration-tester
 
 # SSL/TLS configuration
 ca-cert-file = ${SIGUL_BASE_DIR}/secrets/certificates/ca.crt
 client-cert-file = ${SIGUL_BASE_DIR}/secrets/certificates/client.crt
 client-key-file = ${SIGUL_BASE_DIR}/secrets/certificates/client-key.pem
 require-tls = true
+verify-server-cert = true
 
 # NSS Configuration
 [nss]
