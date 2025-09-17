@@ -1122,29 +1122,6 @@ jobs:
 
           echo "✅ Fresh Sigul infrastructure deployed for functional tests"
 
-      - name: 'Clean up deployment test infrastructure'
-        if: always()
-        shell: bash
-        run: |
-          echo "🧹 Cleaning up deployment test infrastructure..."
-
-          # Stop and remove containers from deployment test
-          containers_to_cleanup=("sigul-server" "sigul-bridge")
-          for container in "${containers_to_cleanup[@]}"; do
-            if docker ps -a --format "{{.Names}}" | \
-               grep -q "^${container}$"; then
-              echo "Stopping and removing ${container}..."
-              docker stop "${container}" >/dev/null 2>&1 || true
-              docker rm "${container}" >/dev/null 2>&1 || true
-            fi
-          done
-
-          # Clean up networks if they exist
-          docker network ls --filter "name=sigul" --format "{{.Name}}" | \
-            xargs -r docker network rm >/dev/null 2>&1 || true
-
-          echo "✅ Deployment test infrastructure cleanup completed"
-
       - name: 'Run integration tests'
         shell: bash
         env:
