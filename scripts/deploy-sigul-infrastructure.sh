@@ -113,14 +113,13 @@ DESCRIPTION:
 
     The script performs:
     1. Environment analysis and prerequisite checking
-    2. Pre-generated configuration files with proper ownership
-    3. SQLite database setup with health checks
-    5. Sigul server and bridge container deployment with diagnostics
+    2. Container image loading and validation
+    3. Sigul server and bridge container deployment with diagnostics
     6. Comprehensive health checks and connectivity verification
 
 IMPROVEMENTS:
     - Better permission handling for GitHub Actions environment
-    - Pre-generated configuration files to avoid read-only mount conflicts
+    - Container-native configuration via sigul-init.sh
     - Enhanced error diagnosis and logging
     - Robust health checks with detailed feedback
     - Container startup diagnostics and troubleshooting
@@ -601,103 +600,7 @@ check_prerequisites() {
 
 
 
-# Generate configurations with proper permissions
-generate_configurations() {
-    log "Generating Sigul configuration files with proper permissions..."
 
-    local config_dir="${PROJECT_ROOT}/configs"
-    mkdir -p "${config_dir}"
-    chmod 755 "${config_dir}"
-    debug "Config directory: $config_dir ($(ls -ld "$config_dir"))"
-
-
-
-    # Generate server configuration
-    log "Creating server configuration..."
-    cat > "${config_dir}/server.conf" << 'EOF'
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
-
-[server]
-bridge-hostname = sigul-bridge
-bridge-port = 44333
-server-cert-nickname = sigul-server-cert
-max-file-payload-size = 2097152
-signing-timeout = 60
-idle-timeout = 300
-
-# Database Configuration - SQLite
-[database]
-database-path = /var/sigul/database/sigul.db
-
-# TLS Configuration using containerized certificates
-ca-cert-file = /var/sigul/secrets/certificates/ca.crt
-server-cert-file = /var/sigul/secrets/certificates/server.crt
-server-key-file = /var/sigul/secrets/certificates/server-key.pem
-require-tls = true
-
-
-[daemon]
-uid = sigul
-gid = sigul
-EOF
-
-    # Generate bridge configuration
-    log "Creating bridge configuration..."
-    cat > "${config_dir}/bridge.conf" << 'EOF'
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
-
-[bridge]
-# Bridge listening ports configuration (binds to all interfaces automatically)
-client-listen-port = 44334
-server-listen-port = 44333
-server-hostname = sigul-server
-bridge-cert-nickname = sigul-bridge-cert
-max-file-payload-size = 2097152
-idle-timeout = 300
-nss-dir = /var/lib/sigul/nss/bridge
-
-# TLS Configuration using containerized certificates
-ca-cert-file = /var/sigul/secrets/certificates/ca.crt
-bridge-cert-file = /var/sigul/secrets/certificates/bridge.crt
-bridge-key-file = /var/sigul/secrets/certificates/bridge-key.pem
-require-tls = true
-EOF
-
-    # Generate client configuration
-    log "Creating client configuration..."
-    cat > "${config_dir}/client.conf" << 'EOF'
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
-
-[client]
-bridge-hostname = sigul-bridge
-bridge-port = 44334
-server-hostname = sigul-server
-max-file-payload-size = 2097152
-username = integration-tester
-
-# TLS Configuration using containerized certificates
-ca-cert-file = /opt/sigul/pki/ca.crt
-require-tls = true
-verify-server-cert = true
-EOF
-
-    # Set proper permissions for all configuration files
-    for config_file in server.conf bridge.conf client.conf; do
-        local config_path="${config_dir}/${config_file}"
-        if [[ -f "$config_path" ]]; then
-            chmod 644 "$config_path"
-            debug "Configuration file created: $config_file ($(ls -l "$config_path"))"
-        else
-            error "Failed to create configuration file: $config_file"
-            exit 1
-        fi
-    done
-
-    success "Configuration files generated with proper permissions"
-}
 
 # Load infrastructure images with enhanced validation
 load_infrastructure_images() {
@@ -1517,7 +1420,7 @@ deploy_infrastructure() {
     # Enhanced deployment steps with better error handling
     analyze_environment || { error "Environment analysis failed"; return 1; }
     check_prerequisites || { error "Prerequisites check failed"; return 1; }
-    generate_configurations || { error "Configuration generation failed"; return 1; }
+
     load_infrastructure_images || { error "Image loading failed"; return 1; }
 
     deploy_sigul_services || { error "Sigul services deployment failed"; return 1; }

@@ -1610,7 +1610,7 @@ generate_server_config() {
 [server]
 # Bridge connection configuration
 bridge-hostname = sigul-bridge
-bridge-port = ${SIGUL_BRIDGE_CLIENT_PORT}
+bridge-port = ${SIGUL_BRIDGE_SERVER_PORT}
 server-cert-nickname = sigul-server-cert
 max-file-payload-size = 2097152
 signing-timeout = 60
@@ -2929,7 +2929,7 @@ verify_bridge_reachability() {
     log "Verifying bridge reachability before server startup..."
 
     local bridge_hostname="${SIGUL_BRIDGE_HOSTNAME:-sigul-bridge}"
-    local bridge_port="${SIGUL_BRIDGE_CLIENT_PORT:-44334}"
+    local bridge_port="${SIGUL_BRIDGE_SERVER_PORT:-44333}"
     local max_attempts=30
     local attempt=1
 
