@@ -244,6 +244,18 @@ collect_nss_metadata() {
         return 1
     fi
 
+    # Handle missing NSS password gracefully
+    if [[ -z "$nss_password" ]]; then
+        health_debug "NSS password not provided for $role, skipping detailed NSS checks"
+        echo '{
+            "healthStatus": "unknown",
+            "nicknames": [],
+            "missingNicknames": [],
+            "error": "nss_password_unavailable"
+        }'
+        return 0
+    fi
+
     health_debug "Collecting NSS metadata for role: $role, directory: $nss_dir"
 
     local database_exists="false"
@@ -521,7 +533,12 @@ check_component_health() {
 
     if [[ "$container_running" == "running" ]]; then
         # Check NSS database
-        nss_metadata=$(collect_nss_metadata "$component" "/var/sigul/nss/$component")
+        # Try to get NSS password, but don't fail if unavailable
+        local nss_password=""
+        if docker exec "$component" test -f "/var/sigul/secrets/${component}_nss_password" 2>/dev/null; then
+            nss_password=$(docker exec "$component" cat "/var/sigul/secrets/${component}_nss_password" 2>/dev/null || echo "")
+        fi
+        nss_metadata=$(collect_nss_metadata "$component" "/var/sigul/nss/$component" "$nss_password")
         local nss_health
         nss_health=$(echo "$nss_metadata" | jq -r '.healthStatus')
 

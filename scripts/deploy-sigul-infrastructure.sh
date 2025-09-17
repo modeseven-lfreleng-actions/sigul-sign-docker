@@ -483,6 +483,7 @@ generate_infrastructure_status() {
         --argjson server_certs "$server_certs" \
         --argjson server_last_failure "$server_last_failure" \
         --argjson all_healthy "$all_healthy" \
+        --arg overall_health_status "$overall_health_status" \
         '{
             "bridge": {
                 "status": $bridge_status,

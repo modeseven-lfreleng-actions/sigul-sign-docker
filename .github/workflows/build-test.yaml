@@ -669,12 +669,12 @@ jobs:
             fi
           done
 
-  sigul-stack-test:
-    name: 'Deploy/Test Stack: ${{ matrix.platform }}'
+  stack-deploy-test:
+    name: 'Stack Deployment Test: ${{ matrix.platform }}'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-    timeout-minutes: 4
+    timeout-minutes: 6
     needs: build-containers
     strategy:
       fail-fast: false
@@ -974,6 +974,177 @@ jobs:
             diagnostics/
           retention-days: 3
 
+  ### Functional Tests ###
+  functional-tests:
+    name: 'Functional Tests: ${{ matrix.platform }}'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    timeout-minutes: 8
+    needs: build-containers
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      # Harden the runner used by this workflow
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: 'Set up Docker Buildx'
+        # yamllint disable-line rule:line-length
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435  # v3.11.1
+
+      - name: 'Detect runner architecture'
+        id: runner-arch
+        shell: bash
+        run: |
+          # Detect the runner architecture
+          ARCH=$(uname -m)
+          case $ARCH in
+            x86_64)
+              PLATFORM_ID="linux-amd64"
+              DOCKER_PLATFORM="linux/amd64"
+              ;;
+            aarch64|arm64)
+              PLATFORM_ID="linux-arm64"
+              DOCKER_PLATFORM="linux/arm64"
+              ;;
+            *)
+              echo "❌ Unsupported architecture: $ARCH"
+              exit 1
+              ;;
+          esac
+          echo "platform-id=${PLATFORM_ID}" >> "$GITHUB_OUTPUT"
+          echo "docker-platform=${DOCKER_PLATFORM}" >> "$GITHUB_OUTPUT"
+          echo "📍 Detected runner architecture: $ARCH -> $PLATFORM_ID"
+
+      - name: 'Download Sigul Client image artifact'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: 'client-${{ steps.runner-arch.outputs.platform-id }}-image'
+          path: /tmp
+
+      - name: 'Download Sigul Server image artifact'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: >-
+            server-${{ steps.runner-arch.outputs.platform-id }}-image
+          path: /tmp
+
+      - name: 'Download Sigul Bridge image artifact'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: >-
+            bridge-${{ steps.runner-arch.outputs.platform-id }}-image
+          path: /tmp
+
+      - name: 'Load and tag container images'
+        shell: bash
+        run: |
+          # Loading/tagging container images
+          PLATFORM_ID="${{ steps.runner-arch.outputs.platform-id }}"
+          echo "🔧 Loading/tagging ${PLATFORM_ID} container images for" \
+            "functional tests"
+
+          # Load sigul-client image
+          CLIENT_IMAGE_FILE="/tmp/client-${PLATFORM_ID}.tar"
+          if [ -f "${CLIENT_IMAGE_FILE}" ]; then
+            echo "Loading Sigul client image for ${PLATFORM_ID}..."
+            docker load --input "${CLIENT_IMAGE_FILE}"
+            docker tag "client:${PLATFORM_ID}" \
+              "client-${PLATFORM_ID}-image:test"
+            echo "✅ Sigul client image loaded and tagged"
+          else
+            echo "❌ Sigul client image not found: ${CLIENT_IMAGE_FILE}"
+            exit 1
+          fi
+
+          # Load server image
+          SERVER_IMAGE_FILE="/tmp/server-${PLATFORM_ID}.tar"
+          if [ -f "${SERVER_IMAGE_FILE}" ]; then
+            echo "Loading server image for ${PLATFORM_ID}..."
+            docker load --input "${SERVER_IMAGE_FILE}"
+            docker tag "server:${PLATFORM_ID}" \
+              "server-${PLATFORM_ID}-image:test"
+            echo "✅ Sigul server image loaded and tagged"
+          else
+            echo "❌ Sigul server image not found: ${SERVER_IMAGE_FILE}"
+            exit 1
+          fi
+
+          # Load bridge image
+          BRIDGE_IMAGE_FILE="/tmp/bridge-${PLATFORM_ID}.tar"
+          if [ -f "${BRIDGE_IMAGE_FILE}" ]; then
+            echo "Loading bridge image for ${PLATFORM_ID}..."
+            docker load --input "${BRIDGE_IMAGE_FILE}"
+            docker tag "bridge:${PLATFORM_ID}" \
+              "bridge-${PLATFORM_ID}-image:test"
+            echo "✅ Sigul bridge image loaded and tagged"
+          else
+            echo "❌ Sigul bridge image not found: ${BRIDGE_IMAGE_FILE}"
+            exit 1
+          fi
+
+          echo "✅ All Sigul images loaded successfully for functional tests"
+
+      - name: 'Deploy fresh Sigul infrastructure for functional tests'
+        shell: bash
+        env:
+          SIGUL_PLATFORM_ID: ${{ steps.runner-arch.outputs.platform-id }}
+          DOCKER_PLATFORM: ${{ steps.runner-arch.outputs.docker-platform }}
+        run: |
+          PLATFORM="${SIGUL_PLATFORM_ID}"
+          echo "🚀 Deploying fresh Sigul infrastructure for functional tests"
+          echo "📦 Platform: ${PLATFORM} (${DOCKER_PLATFORM})"
+
+          # Export platform info for the deployment script
+          export SIGUL_RUNNER_PLATFORM="${SIGUL_PLATFORM_ID}"
+          export SIGUL_DOCKER_PLATFORM="${DOCKER_PLATFORM}"
+
+          # Use the unified deployment script to deploy fresh stack
+          DEPLOY_SCRIPT="scripts/deploy-sigul-infrastructure.sh"
+          chmod +x "${DEPLOY_SCRIPT}"
+          "./${DEPLOY_SCRIPT}" --verbose
+
+          echo "✅ Fresh Sigul infrastructure deployed for functional tests"
+
+      - name: 'Clean up deployment test infrastructure'
+        if: always()
+        shell: bash
+        run: |
+          echo "🧹 Cleaning up deployment test infrastructure..."
+
+          # Stop and remove containers from deployment test
+          containers_to_cleanup=("sigul-server" "sigul-bridge")
+          for container in "${containers_to_cleanup[@]}"; do
+            if docker ps -a --format "{{.Names}}" | \
+               grep -q "^${container}$"; then
+              echo "Stopping and removing ${container}..."
+              docker stop "${container}" >/dev/null 2>&1 || true
+              docker rm "${container}" >/dev/null 2>&1 || true
+            fi
+          done
+
+          # Clean up networks if they exist
+          docker network ls --filter "name=sigul" --format "{{.Name}}" | \
+            xargs -r docker network rm >/dev/null 2>&1 || true
+
+          echo "✅ Deployment test infrastructure cleanup completed"
+
       - name: 'Run integration tests'
         shell: bash
         env:
@@ -984,7 +1155,7 @@ jobs:
           SIGUL_BRIDGE_IMAGE: >-
             bridge-${{ steps.runner-arch.outputs.platform-id }}-image:test
         run: |
-          echo 'Running Sigul integration tests...'
+          echo 'Running Sigul integration tests against fresh infrastructure...'
           chmod +x scripts/run-integration-tests.sh
           ./scripts/run-integration-tests.sh --verbose
 
@@ -1004,6 +1175,37 @@ jobs:
             *.rpm
           retention-days: 7
 
+      - name: 'Clean up functional test infrastructure'
+        if: always()
+        shell: bash
+        run: |
+          echo "🧹 Cleaning up functional test infrastructure..."
+
+          # Stop and remove containers from functional tests
+          containers_to_cleanup=(
+            "sigul-server"
+            "sigul-bridge"
+            "sigul-client-integration"
+          )
+          for container in "${containers_to_cleanup[@]}"; do
+            if docker ps -a --format "{{.Names}}" | \
+               grep -q "^${container}$"; then
+              echo "Stopping and removing ${container}..."
+              docker stop "${container}" >/dev/null 2>&1 || true
+              docker rm "${container}" >/dev/null 2>&1 || true
+            fi
+          done
+
+          # Clean up networks if they exist
+          docker network ls --filter "name=sigul" --format "{{.Name}}" | \
+            xargs -r docker network rm >/dev/null 2>&1 || true
+
+          # Clean up any test volumes
+          docker volume ls --filter "name=sigul" --format "{{.Name}}" | \
+            xargs -r docker volume rm >/dev/null 2>&1 || true
+
+          echo "✅ Functional test infrastructure cleanup completed"
+
   ### Cleanup Sigul Infrastructure ###
   cleanup-infrastructure:
     name: 'Cleanup Infrastructure'
@@ -1011,7 +1213,7 @@ jobs:
     permissions:
       contents: read
     timeout-minutes: 2
-    needs: [sigul-stack-test]
+    needs: [stack-deploy-test, functional-tests]
     if: always()
     steps:
       # Harden the runner used by this workflow
@@ -1050,7 +1252,13 @@ jobs:
   summary:
     name: 'Build Summary'
     runs-on: 'ubuntu-latest'
-    needs: [build-containers, client-mock-test, publish-ghcr, sigul-stack-test]
+    needs: [
+      build-containers,
+      client-mock-test,
+      publish-ghcr,
+      stack-deploy-test,
+      functional-tests
+    ]
     if: always()
     timeout-minutes: 1
     # yamllint disable rule:line-length
@@ -1068,16 +1276,20 @@ jobs:
 
             # Note: In real implementation, check actual job statuses
             echo "| linux/amd64 | ${{ needs.build-containers.result }} |" \
-              " ${{ needs.client-mock-test.result }} | ${{ needs.sigul-stack-test.result }} |" \
-              " ${{ needs.sigul-stack-test.result }} | Complete |"
+              " ${{ needs.client-mock-test.result }} | ${{ needs.stack-deploy-test.result }} |" \
+              " ${{ needs.functional-tests.result }} | Complete |"
             echo "| linux/arm64 | ${{ needs.build-containers.result }} |" \
-              " ${{ needs.client-mock-test.result }} | ${{ needs.sigul-stack-test.result }} |" \
-              " ${{ needs.sigul-stack-test.result }} | Complete |"
+              " ${{ needs.client-mock-test.result }} | ${{ needs.stack-deploy-test.result }} |" \
+              " ${{ needs.functional-tests.result }} | Complete |"
             echo ""
 
-            echo "### Stack Deployment & Integration Tests"
-            echo "- **Status**: ${{ needs.sigul-stack-test.result }}"
-            echo "- **Includes**: Stack deployment, infrastructure setup, integration testing"
+            echo "### Stack Deployment Tests"
+            echo "- **Status**: ${{ needs.stack-deploy-test.result }}"
+            echo "- **Includes**: Stack deployment validation, infrastructure setup"
+            echo ""
+            echo "### Functional Tests"
+            echo "- **Status**: ${{ needs.functional-tests.result }}"
+            echo "- **Includes**: Integration testing against fresh infrastructure"
             echo ""
 
             echo "### GHCR Publishing"
