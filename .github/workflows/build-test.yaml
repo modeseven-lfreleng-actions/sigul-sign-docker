@@ -891,13 +891,16 @@ jobs:
           # Stream container logs immediately to workflow output for visibility
           echo "::group::Container Log Streaming (Immediate Visibility)"
           for container in sigul-server sigul-bridge; do
-            if docker ps -a --format "{{.Names}}" | grep -q "^${container}$"; then
+            if docker ps -a --format "{{.Names}}" | \
+              grep -q "^${container}$"; then
               echo "=== ${container} logs (last 100 lines) ==="
-              docker logs --tail 100 "${container}" 2>&1 || echo "Unable to fetch logs from ${container}"
+              docker logs --tail 100 "${container}" 2>&1 || \
+                echo "Unable to fetch logs from ${container}"
               echo ""
               echo "=== ${container} container status ==="
               docker container inspect "${container}" --format \
-                'Status: {{.State.Status}} (Exit: {{.State.ExitCode}})' 2>/dev/null || echo "Cannot inspect ${container}"
+                'Status: {{.State.Status}} (Exit: {{.State.ExitCode}})' \
+                2>/dev/null || echo "Cannot inspect ${container}"
               echo ""
             else
               echo "Container not found: ${container}"

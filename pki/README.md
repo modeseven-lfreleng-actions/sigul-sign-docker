@@ -30,8 +30,7 @@ This directory contains the PKI infrastructure for Sigul integration testing.
 
 ## Client PKI
 
-The system packages client PKI separately in `pki/client-pki-encrypted.asc`
-and includes:
+The system packages client PKI separately in `pki/client-pki-encrypted.asc` and includes:
 
 - Client certificate and private key
 - CA certificate for verification
@@ -40,14 +39,15 @@ and includes:
 
 ## Usage in Docker Compose
 
-This script generates certificates for containerized deployments where
-sigul-init.sh handles certificates.
+This script uses the existing shared CA from the repository and generates
+component certificates for containerized deployments. The shared CA ensures
+consistent trust relationships across all deployments.
 
 ## Usage in Workflows
 
 The system generates client PKI dynamically during workflow execution using the
-`./scripts/generate-test-pki.sh` script. This process captures the generated
-encrypted PKI content and passes it via environment variables.
+`./scripts/generate-test-pki.sh` script. The workflows will capture the
+generated encrypted PKI content and pass it via environment variables.
 
 Example workflow usage:
 
@@ -65,3 +65,7 @@ Example workflow usage:
 ## Security Note
 
 This PKI infrastructure serves testing purposes. Do not use in production.
+
+The shared CA certificate and private key exist in the repository for
+consistent testing across environments. In production, use a proper Certificate
+Authority with appropriate security controls.

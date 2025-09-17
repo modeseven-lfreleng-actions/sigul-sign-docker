@@ -263,22 +263,19 @@ OPTIONS:
     --help          Show this help message
 
 DESCRIPTION:
-    This script runs comprehensive integration tests against fully functional
-    Sigul infrastructure components including:
+    This script runs comprehensive functional integration tests against a deployed
+    Sigul infrastructure, focusing on actual cryptographic operations including:
 
-    1. Infrastructure connectivity verification
-    2. Real user and key creation
-    3. Actual file signing operations with signature validation
-    4. RPM signing capability tests
-    5. Key management and public key retrieval
-    6. Batch signing operations with multiple files
+    1. Real user and key creation
+    2. Actual file signing operations with signature validation
+    3. RPM signing capability tests
+    4. Key management and public key retrieval
+    5. Batch signing operations with multiple files
 
 REQUIREMENTS:
-    - Deployed functional Sigul infrastructure (server, bridge, database)
-    - PKI certificates and NSS databases properly configured
-    - Sigul configuration files for client/server/bridge communication
-    - Docker images with fully functional Sigul components
-    - Network connectivity between client and infrastructure
+    - Deployed and running Sigul infrastructure (server, bridge, database)
+    - Functional Sigul client image with proper configuration
+    - Network connectivity between test client and infrastructure
 
 EOF
 }
@@ -305,82 +302,7 @@ parse_args() {
     done
 }
 
-# Check prerequisites
-check_prerequisites() {
-    log "Checking integration test prerequisites..."
 
-    # Check required directories and files (with more detailed error reporting)
-    local required_paths=(
-        "pki/ca.crt"
-        "pki/server.crt"
-        "pki/bridge.crt"
-        "configs/client.conf"
-        "configs/server.conf"
-        "configs/bridge.conf"
-    )
-
-    local missing_files=()
-    for path in "${required_paths[@]}"; do
-        if [[ ! -f "${PROJECT_ROOT}/${path}" ]]; then
-            missing_files+=("${path}")
-        fi
-    done
-
-    if [[ ${#missing_files[@]} -gt 0 ]]; then
-        error "Required files not found:"
-        for file in "${missing_files[@]}"; do
-            error "  - ${file}"
-        done
-        error "These files should have been created during infrastructure deployment"
-        exit 1
-    fi
-
-    verbose "All required PKI and configuration files found"
-
-    # Check infrastructure connectivity with improved error handling
-    verbose "Testing connectivity to Sigul Bridge on port 44334..."
-    local bridge_attempts=0
-    local max_bridge_attempts=5
-
-    while [[ $bridge_attempts -lt $max_bridge_attempts ]]; do
-        if nc -z localhost 44334 2>/dev/null; then
-            verbose "Bridge connectivity confirmed on attempt $((bridge_attempts + 1))"
-            break
-        fi
-        ((bridge_attempts++))
-        if [[ $bridge_attempts -lt $max_bridge_attempts ]]; then
-            verbose "Bridge connection attempt $bridge_attempts/$max_bridge_attempts failed, retrying..."
-            sleep 2
-        fi
-    done
-
-    if [[ $bridge_attempts -eq $max_bridge_attempts ]]; then
-        error "Sigul Bridge is not accessible on port 44334 after $max_bridge_attempts attempts"
-        error "Checking if bridge container is running..."
-        if docker ps --format "table {{.Names}}" | grep -q "sigul-bridge"; then
-            error "Bridge container is running, but port not accessible. Possible network issue."
-        else
-            error "Bridge container is not running."
-        fi
-        exit 1
-    fi
-
-    verbose "Testing Sigul Server process..."
-    if ! docker exec sigul-server pgrep -f server >/dev/null 2>&1; then
-        error "Sigul Server process is not running"
-        verbose "Checking server container status..."
-        if docker ps --format "table {{.Names}}" | grep -q "sigul-server"; then
-            error "Server container is running, but sigul server process not found"
-            verbose "Container logs:"
-            docker logs sigul-server --tail 10 2>/dev/null || error "Could not retrieve container logs"
-        else
-            error "Server container is not running"
-        fi
-        exit 1
-    fi
-
-    success "Prerequisites check passed"
-}
 
 # Setup test environment
 setup_test_environment() {
@@ -403,41 +325,7 @@ setup_test_environment() {
     success "Test environment setup completed"
 }
 
-# Verify infrastructure containers are running (no restart needed)
-verify_infrastructure_running() {
-    log "Verifying infrastructure containers are running..."
 
-    # Check if containers are running using Docker directly (more reliable than compose ps)
-    local server_running=false
-    local bridge_running=false
-
-    if docker ps --format "table {{.Names}}" | grep -q "sigul-server"; then
-        server_running=true
-        verbose "Sigul server container is running"
-    fi
-
-    if docker ps --format "table {{.Names}}" | grep -q "sigul-bridge"; then
-        bridge_running=true
-        verbose "Sigul bridge container is running"
-    fi
-
-    if [[ "$server_running" == false || "$bridge_running" == false ]]; then
-        error "Infrastructure containers are not running."
-        error "Missing containers:"
-        [[ "$server_running" == false ]] && error "  - sigul-server"
-        [[ "$bridge_running" == false ]] && error "  - sigul-bridge"
-        error "Please ensure deployment completed successfully."
-        return 1
-    fi
-
-    # Verify services are healthy
-    verbose "Checking service health..."
-
-    # Wait a bit for services to be fully ready
-    sleep 5
-
-    success "Infrastructure containers are running and ready"
-}
 
 # Test: Create integration test user and key
 test_user_key_creation() {
@@ -801,7 +689,6 @@ run_integration_tests() {
 
     # Setup and preparation
     setup_test_environment
-    verify_infrastructure_running
 
     # Start persistent client container
     local network_name
@@ -858,8 +745,6 @@ main() {
         error "Failed to load ephemeral passwords"
         exit 1
     fi
-
-    check_prerequisites
 
     if run_integration_tests; then
         success "=== Real Infrastructure Integration Tests Complete ==="

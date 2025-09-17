@@ -1,4 +1,0 @@
-NAME                   IMAGE                                                                                 COMMAND                  SERVICE          CREATED          STATUS                          PORTS
-sigul-bridge           bridge-linux-arm64-image:test                                                         "/usr/local/bin/sigu…"   sigul-bridge     42 seconds ago   Restarting (1) 11 seconds ago
-sigul-network-tester   alpine:3.19@sha256:3be987e6cde1d07e873c012bf6cfe941e6e85d16ca5fc5b8bedc675451d2de67   "sh -c 'apk add --no…"   network-tester   11 seconds ago   Up 10 seconds
-sigul-server           server-linux-arm64-image:test                                                         "/usr/local/bin/sigu…"   sigul-server     42 seconds ago   Restarting (1) 11 seconds ago

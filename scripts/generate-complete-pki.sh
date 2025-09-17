@@ -65,17 +65,37 @@ log "Temporary directory: $TEMP_DIR"
 mkdir -p "$TEST_PKI_DIR"
 mkdir -p "$TEMP_DIR/client-pki/.sigul"
 
-log "=== Step 1: Generate Root Certificate Authority ==="
+log "=== Step 1: Use Existing Repository CA ==="
 
-# Generate CA private key
-openssl genrsa -aes256 -out "$TEMP_DIR/ca-key.pem" -passout pass:"$CA_PASS" $RSA_BITS
-log "Generated CA private key"
+# Use existing CA from repository instead of generating new one
+repo_ca_cert="$PROJECT_ROOT/pki/ca.crt"
+repo_ca_key="$PROJECT_ROOT/pki/ca-key.pem"
 
-# Generate CA certificate
-openssl req -new -x509 -days $CA_DAYS -key "$TEMP_DIR/ca-key.pem" \
-    -out "$TEST_PKI_DIR/ca.crt" -passin pass:"$CA_PASS" \
-    -subj "$CA_SUBJECT"
-log "Generated CA certificate: $TEST_PKI_DIR/ca.crt"
+if [[ ! -f "$repo_ca_cert" ]]; then
+    error "Repository CA certificate not found: $repo_ca_cert"
+    error "Run './pki/setup-ca.sh' to create the shared CA first"
+    exit 1
+fi
+
+if [[ ! -f "$repo_ca_key" ]]; then
+    error "Repository CA private key not found: $repo_ca_key"
+    error "Run './pki/setup-ca.sh' to create the shared CA first"
+    exit 1
+fi
+
+# Copy existing CA to working directory (don't overwrite the repository CA)
+if [[ "$repo_ca_cert" != "$TEST_PKI_DIR/ca.crt" ]]; then
+    cp "$repo_ca_cert" "$TEST_PKI_DIR/ca.crt"
+    log "Copied shared CA certificate to: $TEST_PKI_DIR/ca.crt"
+else
+    log "Using shared CA certificate from: $repo_ca_cert"
+fi
+
+cp "$repo_ca_key" "$TEMP_DIR/ca-key.pem"
+log "Using existing shared CA from repository: $repo_ca_cert"
+
+# Set up CA password (repository CA is unencrypted for testing)
+CA_PASS=""
 
 # Copy CA certificate to client PKI
 cp "$TEST_PKI_DIR/ca.crt" "$TEMP_DIR/client-pki/.sigul/ca.crt"
@@ -107,8 +127,7 @@ EOF
 openssl x509 -req -in "$TEMP_DIR/server.csr" -CA "$TEST_PKI_DIR/ca.crt" \
     -CAkey "$TEMP_DIR/ca-key.pem" -CAcreateserial \
     -out "$TEST_PKI_DIR/server.crt" -days $SERVER_DAYS \
-    -extfile "$TEMP_DIR/server.ext" \
-    -passin pass:"$CA_PASS"
+    -extfile "$TEMP_DIR/server.ext"
 log "Generated server certificate: $TEST_PKI_DIR/server.crt"
 
 log "=== Step 3: Generate Bridge Certificate (sigul-bridge) ==="
@@ -138,8 +157,7 @@ EOF
 openssl x509 -req -in "$TEMP_DIR/bridge.csr" -CA "$TEST_PKI_DIR/ca.crt" \
     -CAkey "$TEMP_DIR/ca-key.pem" -CAcreateserial \
     -out "$TEST_PKI_DIR/bridge.crt" -days $SERVER_DAYS \
-    -extfile "$TEMP_DIR/bridge.ext" \
-    -passin pass:"$CA_PASS"
+    -extfile "$TEMP_DIR/bridge.ext"
 log "Generated bridge certificate: $TEST_PKI_DIR/bridge.crt"
 
 log "=== Step 4: Generate Client Certificate ==="
@@ -163,8 +181,7 @@ EOF
 openssl x509 -req -in "$TEMP_DIR/client.csr" -CA "$TEST_PKI_DIR/ca.crt" \
     -CAkey "$TEMP_DIR/ca-key.pem" -CAcreateserial \
     -out "$TEMP_DIR/client-pki/.sigul/client.crt" -days $CLIENT_DAYS \
-    -extfile "$TEMP_DIR/client.ext" \
-    -passin pass:"$CA_PASS"
+    -extfile "$TEMP_DIR/client.ext"
 log "Generated client certificate"
 
 log "=== Step 5: Create Client Configuration ==="
@@ -331,7 +348,7 @@ The client PKI is packaged separately in \`pki/client-pki-encrypted.asc\` and co
 
 ## Usage in Docker Compose
 
-This script generates certificates for containerized deployments where certificates are managed via sigul-init.sh.
+This script uses the existing shared CA from the repository and generates component certificates for containerized deployments. The shared CA ensures consistent trust relationships across all deployments.
 
 ## Usage in Workflows
 
@@ -352,6 +369,8 @@ Example workflow usage:
 ## Security Note
 
 This PKI infrastructure is for testing purposes only. Do not use in production.
+
+The shared CA certificate and private key are stored in the repository for consistent testing across environments. In production, use a proper Certificate Authority with appropriate security controls.
 EOF
 
 log "Created PKI documentation"
@@ -413,5 +432,7 @@ log "Encryption password for client PKI: $GPG_ENCRYPT_PASS"
 log ""
 log "=== PKI Generation Complete ==="
 log "The PKI infrastructure is ready for Sigul integration testing."
+log "Used shared CA from repository: $PROJECT_ROOT/pki/ca.crt"
+log "Generated component certificates signed by shared CA."
 log "Server and bridge containers will use certificates from: $TEST_PKI_DIR"
 log "Client containers will use the encrypted PKI archive: $TEST_PKI_DIR/client-pki-encrypted.asc"

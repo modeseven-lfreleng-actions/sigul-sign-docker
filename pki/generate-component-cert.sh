@@ -1,4 +1,8 @@
 #!/bin/bash
+
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2025 The Linux Foundation
+
 # Helper script to generate component certificates signed by the shared CA
 # Usage: ./generate-component-cert.sh <component> <output-dir>
 
