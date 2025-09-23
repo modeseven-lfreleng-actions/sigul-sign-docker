@@ -1004,7 +1004,7 @@ EOF
                 done
 
                 # Validate individual JSON file
-                if cat "$cert_file" | jq . >/dev/null 2>&1; then
+                if jq . "$cert_file" >/dev/null 2>&1; then
                     debug "Individual certificate JSON is valid"
                 else
                     debug "WARNING: Individual certificate JSON is invalid!"
@@ -1746,6 +1746,7 @@ generate_client_config() {
     export SIGUL_BRIDGE_CLIENT_PORT="${SIGUL_BRIDGE_CLIENT_PORT:-44334}"
     export SIGUL_SERVER_HOST="${SIGUL_SERVER_HOST:-sigul-server}"
     export SIGUL_NSS_DIR="$nss_dir"
+    export SIGUL_BASE_DIR="${SIGUL_BASE_DIR:-/var/sigul}"
 
     # Create client configuration content with variable substitution
     cat > "$config_file" << CLIENT_CONFIG_EOF

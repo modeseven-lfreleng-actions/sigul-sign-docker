@@ -642,3 +642,162 @@ efficient and reliable.
 
 - `./build-scripts/install-sigul.sh --help` - Show install script options
 - `./build-scripts/install-sigul.sh --verify client` - Test client installation
+
+## Stack Testing with Local Docker Environments
+
+For local development and troubleshooting, the deployment scripts support a special **local debugging mode** that persists infrastructure containers for analysis and prevents automatic cleanup.
+
+### Local Debug Mode
+
+When developing or debugging Sigul integration issues locally, use the `--local-debug` flag to:
+
+- **Persist Infrastructure**: Containers remain running after tests complete
+- **Skip Cleanup**: No automatic cleanup of containers, networks, or volumes
+- **Enable Verbose Output**: Detailed logging for troubleshooting
+- **Clear Local Indicators**: Visual warnings that you're in local debug mode
+
+### Usage Examples
+
+#### Deploy Infrastructure for Local Debugging
+
+```bash
+# Deploy with persistent infrastructure
+./scripts/deploy-sigul-infrastructure.sh --local-debug
+
+# This will show:
+# 🔧 --- LOCAL DEBUGGING MODE ENABLED ---
+#    Infrastructure will persist for troubleshooting
+#    Use 'docker compose -f docker-compose.sigul.yml down -v' to cleanup
+```
+
+#### Run Integration Tests with Persistent Containers
+
+```bash
+# Run tests without cleanup
+export SIGUL_CLIENT_IMAGE="client-linux-arm64-image:test"
+./scripts/run-integration-tests.sh --local-debug
+
+# This will show:
+# 🔧 --- LOCAL DEBUGGING MODE ENABLED ---
+#    Infrastructure will remain for troubleshooting
+```
+
+#### Manual Certificate Exchange for Debugging
+
+```bash
+# After deployment, fix SSL certificates manually
+./debug/fix_backend_ssl_certs.sh --verbose
+
+# Test client connectivity
+./debug/test_client_connection.sh --verbose
+```
+
+### Local Debugging Workflow
+
+1. **Deploy Fresh Infrastructure**:
+
+   ```bash
+   # Clean up any existing containers first
+   docker compose -f docker-compose.sigul.yml down -v --remove-orphans
+
+   # Deploy with persistence
+   ./scripts/deploy-sigul-infrastructure.sh --local-debug
+   ```
+
+2. **Fix SSL Certificates** (required for current version):
+
+   ```bash
+   ./debug/fix_backend_ssl_certs.sh --verbose
+   ```
+
+3. **Run Tests with Persistence**:
+
+   ```bash
+   export SIGUL_CLIENT_IMAGE="client-linux-arm64-image:test"
+   ./scripts/run-integration-tests.sh --local-debug
+   ```
+
+4. **Debug Infrastructure State**:
+
+   ```bash
+   # Check container status
+   docker ps
+
+   # Check container logs
+   docker logs sigul-server
+   docker logs sigul-bridge
+
+   # Check NSS databases
+   docker exec sigul-bridge certutil -L -d /var/sigul/nss/bridge
+   docker exec sigul-server certutil -L -d /var/sigul/nss/server
+
+   # Check network connectivity
+   docker exec sigul-bridge ss -tlnp | grep 4433
+   docker exec sigul-server ss -tn | grep 44333
+   ```
+
+5. **Manual Cleanup When Done**:
+
+   ```bash
+   # Clean up everything
+   docker compose -f docker-compose.sigul.yml down -v --remove-orphans
+   docker system prune -f
+   ```
+
+### Platform Compatibility
+
+The local debug mode works on **all platforms** where Docker is available:
+
+- **macOS** (Intel and Apple Silicon)
+- **Linux** (x86_64 and ARM64)
+- **Windows** (with WSL2/Docker Desktop)
+
+### Key Benefits for Local Development
+
+- **Faster Iteration**: No need to redeploy infrastructure for each test
+- **Deep Debugging**: Containers remain accessible for log analysis
+- **State Inspection**: Examine NSS databases, certificates, and configuration
+- **Network Analysis**: Debug SSL/TLS connections and certificate exchange
+- **Persistent Testing**: Multiple test runs against same infrastructure
+
+### Current Known Issues (Local Debug Mode)
+
+1. **SSL Certificate Exchange**: Requires manual fix after deployment
+
+   ```bash
+   ./debug/fix_backend_ssl_certs.sh --verbose
+   ```
+
+2. **Admin User Creation**: EOFError in batch mode during server initialization
+   - Admin user creation fails during container startup
+   - This causes client authentication to fail
+   - Fix in development for server initialization script
+
+3. **Integration Test Dependencies**: Some tests expect fresh containers
+   - Client certificate import to bridge happens in integration script
+   - May need multiple runs to get full certificate exchange
+
+### Troubleshooting Tips
+
+- **Always start with fresh deployment** when debugging new issues
+- **Check SSL certificates first** - most communication issues are certificate-related
+- **Use verbose mode** to get detailed logging output
+- **Check container logs** before assuming configuration issues
+- **Verify network connectivity** at the socket level before debugging application layer
+
+### Debugging Resources
+
+- **`debug/fix_backend_ssl_certs.sh`** - Fix server↔bridge certificate exchange
+- **`debug/test_client_connection.sh`** - Test client↔bridge SSL connectivity
+- **`DEBUGGING_PROCESS_AND_FINDINGS.md`** - Comprehensive debugging documentation
+- **`debug/correct_testing_process.sh`** - Demonstrates proper fresh container testing
+
+### Integration with CI/CD
+
+The local debug mode is **automatically disabled in CI/CD environments**. The scripts detect GitHub Actions and other CI environments and always perform proper cleanup.
+
+Local debug mode only activates when:
+
+- `--local-debug` flag is explicitly provided
+- Running in interactive terminal (not CI/CD)
+- Docker environment is available locally

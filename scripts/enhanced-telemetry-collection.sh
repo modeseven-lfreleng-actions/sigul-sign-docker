@@ -768,7 +768,7 @@ analyze_failures() {
         echo "## Telemetry Files Generated"
         echo ""
         find "$OUTPUT_DIR" -type f -name "*.txt" -o -name "*.log" -o -name "*.md" | sort | while read -r file; do
-            local rel_path="${file#$OUTPUT_DIR/}"
+            local rel_path="${file#"$OUTPUT_DIR"/}"
             echo "- \`$rel_path\`"
         done
 

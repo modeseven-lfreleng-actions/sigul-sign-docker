@@ -14,6 +14,7 @@
 # Options:
 #   --verbose       Enable verbose output
 #   --debug         Enable debug mode with detailed diagnostics
+#   --local-debug   Enable local debugging mode (persistent infrastructure)
 #   --help          Show this help message
 
 set -euo pipefail
@@ -30,6 +31,7 @@ source "${SCRIPT_DIR}/lib/health.sh"
 # Default options
 VERBOSE_MODE=false
 DEBUG_MODE=false
+LOCAL_DEBUG_MODE=false
 SHOW_HELP=false
 
 # Colors for output
@@ -105,6 +107,7 @@ USAGE:
 OPTIONS:
     --verbose       Enable verbose output
     --debug         Enable debug mode with detailed diagnostics
+    --local-debug   Enable local debugging mode (persistent infrastructure)
     --help          Show this help message
 
 DESCRIPTION:
@@ -137,7 +140,12 @@ parse_args() {
                 ;;
             --debug)
                 DEBUG_MODE=true
-                VERBOSE_MODE=true
+                VERBOSE_MODE=true  # Debug implies verbose
+                shift
+                ;;
+            --local-debug)
+                LOCAL_DEBUG_MODE=true
+                VERBOSE_MODE=true  # Local debug implies verbose
                 shift
                 ;;
             --help)
@@ -176,6 +184,7 @@ EOF
 }
 
 # Check bridge port and internal socket connectivity with structured output
+# shellcheck disable=SC2317  # Function may be called indirectly or in future usage
 check_bridge_connectivity() {
     local check_result
     check_result='{
@@ -539,11 +548,19 @@ analyze_environment() {
     debug "  Runner platform: ${SIGUL_RUNNER_PLATFORM:-auto-detect}"
     debug "  Docker platform: ${SIGUL_DOCKER_PLATFORM:-auto-detect}"
 
-    # Check disk space
+    # Check disk space (cross-platform)
     local available_space
-    available_space=$(df -BG . | tail -1 | awk '{print $4}' | tr -d 'G')
-    if [[ "${available_space:-0}" -lt 2 ]]; then
+    if command -v df >/dev/null 2>&1; then
+        # Try Linux format first, fall back to macOS/BSD format
+        available_space=$(df -BG . 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G' || \
+                         df -h . | tail -1 | awk '{print $4}' | sed 's/[^0-9]//g')
+    else
+        available_space="unknown"
+    fi
+    if [[ "${available_space:-0}" =~ ^[0-9]+$ ]] && [[ "${available_space}" -lt 2 ]]; then
         warn "Low disk space: ${available_space}GB available"
+    elif [[ "${available_space}" == "unknown" ]]; then
+        verbose "Disk space check skipped (df command unavailable)"
     else
         debug "Available disk space: ${available_space}GB"
     fi
@@ -1083,6 +1100,69 @@ deploy_sigul_services() {
     success "All Sigul services deployed successfully"
 }
 
+# Fix SSL certificate issue by importing client certificate to bridge
+# This resolves the "Unexpected EOF in NSPR" error in SSL client authentication
+# shellcheck disable=SC2317  # Function may be called indirectly or in future usage
+import_client_cert_to_bridge() {
+    local client_container="$1"
+    local bridge_container="sigul-bridge"
+
+    log "Importing client certificate to bridge for SSL authentication..."
+
+    # Wait for client container to be fully initialized with NSS database
+    local max_wait=30
+    local wait_count=0
+    while [[ $wait_count -lt $max_wait ]]; do
+        if docker exec "$client_container" test -f /var/sigul/nss/client/cert9.db 2>/dev/null; then
+            break
+        fi
+        sleep 1
+        ((wait_count++))
+    done
+
+    if [[ $wait_count -ge $max_wait ]]; then
+        error "Client NSS database not ready after ${max_wait}s"
+        return 1
+    fi
+
+    # Remove any existing/stale client certificate from bridge
+    docker exec "$bridge_container" certutil -D -d /var/sigul/nss/bridge -n sigul-client-cert 2>/dev/null || true
+
+    # Export current client certificate from client container
+    if ! docker exec "$client_container" certutil -L -d /var/sigul/nss/client -n sigul-client-cert -a > /tmp/current-client-cert.pem 2>/dev/null; then
+        error "Failed to export client certificate from client container"
+        return 1
+    fi
+
+    # Import to bridge with proper trust flags for SSL client authentication
+    docker cp /tmp/current-client-cert.pem "$bridge_container":/tmp/
+
+    if docker exec "$bridge_container" certutil -A -d /var/sigul/nss/bridge \
+        -n sigul-client-cert \
+        -t "P,," \
+        -a -i /tmp/current-client-cert.pem \
+        -f /var/sigul/secrets/bridge_nss_password 2>/dev/null; then
+
+        success "Client certificate imported to bridge NSS database"
+
+        # Verify the import
+        if docker exec "$bridge_container" certutil -L -d /var/sigul/nss/bridge -n sigul-client-cert >/dev/null 2>&1; then
+            verbose "SSL certificate fix verified: client cert now in bridge NSS database"
+        else
+            warn "SSL certificate import verification failed"
+        fi
+    else
+        error "Failed to import client certificate to bridge"
+        return 1
+    fi
+
+    # Cleanup temporary files
+    rm -f /tmp/current-client-cert.pem
+    docker exec "$bridge_container" rm -f /tmp/current-client-cert.pem 2>/dev/null || true
+
+    return 0
+}
+
 # Comprehensive infrastructure health verification
 verify_infrastructure() {
     log "Performing comprehensive infrastructure health verification..."
@@ -1469,9 +1549,16 @@ main() {
     fi
 
     log "=== Sigul Infrastructure Deployment ==="
-    log "Verbose mode: ${VERBOSE_MODE}"
-    log "Debug mode: ${DEBUG_MODE}"
-    log "Project root: ${PROJECT_ROOT}"
+    if [[ "$LOCAL_DEBUG_MODE" == "true" ]]; then
+        warn "🔧 --- LOCAL DEBUGGING MODE ENABLED ---"
+        warn "   Infrastructure will persist for troubleshooting"
+        warn "   Use 'docker compose -f docker-compose.sigul.yml down -v' to cleanup"
+        echo
+    fi
+    log "Verbose mode: $VERBOSE_MODE"
+    log "Debug mode: $DEBUG_MODE"
+    log "Local debug mode: $LOCAL_DEBUG_MODE"
+    log "Project root: $PROJECT_ROOT"
     log "Runner platform: ${SIGUL_RUNNER_PLATFORM:-auto-detect}"
     log "Docker platform: ${SIGUL_DOCKER_PLATFORM:-auto-detect}"
 

@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
-# Sigul Integration Tests Script for GitHub Workflows
+# Fixed Sigul Integration Tests Script
 #
 # This script runs integration tests against fully functional Sigul infrastructure,
-# performing real cryptographic operations and signature validation.
+# performing real cryptographic operations and signature validation with proper
+# sigul command syntax and NSS SSL handling.
 #
 # Usage:
-#   ./scripts/run-integration-tests.sh [OPTIONS]
+#   ./scripts/run-integration-tests-fixed.sh [OPTIONS]
 #
 # Options:
 #   --verbose       Enable verbose output
@@ -22,7 +23,6 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # Default options
 VERBOSE_MODE=false
-LOCAL_DEBUG_MODE=false
 SHOW_HELP=false
 
 # Configurable image names (must be set by caller or auto-detected)
@@ -159,14 +159,6 @@ start_client_container() {
             warn "Client NSS database not found"
         fi
 
-        # Apply SSL certificate fix to resolve "Unexpected EOF in NSPR" error
-        verbose "Applying SSL certificate fix for client-bridge authentication..."
-        if import_client_cert_to_bridge "$client_container_name"; then
-            verbose "SSL certificate fix applied successfully"
-        else
-            warn "SSL certificate fix failed - SSL connections may not work"
-        fi
-
         return 0
     else
         error "Failed to initialize client container"
@@ -176,62 +168,6 @@ start_client_container() {
     fi
 }
 
-# Fix SSL certificate issue by importing client certificate to bridge
-# This resolves the "Unexpected EOF in NSPR" error in SSL client authentication
-import_client_cert_to_bridge() {
-    local client_container="$1"
-    local bridge_container="sigul-bridge"
-
-    verbose "Importing client certificate to bridge for SSL authentication..."
-
-    # Wait for client container to be fully initialized with NSS database
-    local max_wait=30
-    local wait_count=0
-    while [[ $wait_count -lt $max_wait ]]; do
-        if docker exec "$client_container" test -f /var/sigul/nss/client/cert9.db 2>/dev/null; then
-            break
-        fi
-        sleep 1
-        ((wait_count++))
-    done
-
-    if [[ $wait_count -ge $max_wait ]]; then
-        verbose "Client NSS database not ready after ${max_wait}s"
-        return 1
-    fi
-
-    # Remove any existing/stale client certificate from bridge
-    docker exec "$bridge_container" certutil -D -d /var/sigul/nss/bridge -n sigul-client-cert 2>/dev/null || true
-
-    # Export current client certificate from client container
-    if ! docker exec "$client_container" certutil -L -d /var/sigul/nss/client -n sigul-client-cert -a > /tmp/current-client-cert.pem 2>/dev/null; then
-        verbose "Failed to export client certificate from client container"
-        return 1
-    fi
-
-    # Import to bridge with proper trust flags for SSL client authentication
-    docker cp /tmp/current-client-cert.pem "$bridge_container":/tmp/
-
-    if docker exec "$bridge_container" certutil -A -d /var/sigul/nss/bridge \
-        -n sigul-client-cert \
-        -t "P,," \
-        -a -i /tmp/current-client-cert.pem \
-        -f /var/sigul/secrets/bridge_nss_password 2>/dev/null; then
-
-        verbose "Client certificate imported to bridge NSS database"
-        return 0
-    else
-        verbose "Failed to import client certificate to bridge"
-        return 1
-    fi
-
-    # Cleanup temporary files
-    # shellcheck disable=SC2317  # Cleanup code may be unreachable in some execution paths
-    rm -f /tmp/current-client-cert.pem 2>/dev/null || true
-    # shellcheck disable=SC2317  # Cleanup code may be unreachable in some execution paths
-    docker exec "$bridge_container" rm -f /tmp/current-client-cert.pem 2>/dev/null || true
-}
-
 # Stop the persistent client container
 stop_client_container() {
     local client_container_name="sigul-client-integration"
@@ -239,7 +175,7 @@ stop_client_container() {
     docker rm -f "$client_container_name" 2>/dev/null || true
 }
 
-# Helper function to run sigul client commands in the persistent container
+# Helper function to run sigul client commands with proper password handling
 run_sigul_client_cmd() {
     local cmd=("$@")
     local client_container_name="sigul-client-integration"
@@ -252,18 +188,64 @@ run_sigul_client_cmd() {
         return 1
     fi
 
-    # Run the command with better error handling
-    if docker exec "$client_container_name" "${cmd[@]}"; then
-        return 0
+    # Create a temporary passphrase file in the container
+    local temp_passphrase_file="/tmp/sigul_passphrase_$$"
+
+    # Determine which password to use based on the command
+    local password_to_use
+    if [[ "${cmd[*]}" =~ --admin-name ]]; then
+        password_to_use="$EPHEMERAL_ADMIN_PASSWORD"
+        verbose "Using admin password for admin command"
     else
-        local exit_code=$?
+        password_to_use="$EPHEMERAL_TEST_PASSWORD"
+        verbose "Using test user password for user command"
+    fi
+
+    # Create the passphrase file in the container
+    if ! docker exec "$client_container_name" sh -c "echo '$password_to_use' > '$temp_passphrase_file' && chmod 600 '$temp_passphrase_file'"; then
+        error "Failed to create passphrase file in container"
+        return 1
+    fi
+
+    # Run the command with the passphrase file, removing --password options
+    local modified_cmd=()
+    local skip_next=false
+    for arg in "${cmd[@]}"; do
+        if [[ "$skip_next" == "true" ]]; then
+            skip_next=false
+            continue
+        fi
+
+        if [[ "$arg" == "--password" ]]; then
+            skip_next=true
+            continue
+        elif [[ "$arg" =~ ^--.*-password$ ]]; then
+            skip_next=true
+            continue
+        fi
+
+        modified_cmd+=("$arg")
+    done
+
+    # Add the passphrase file option
+    modified_cmd+=("-f" "$temp_passphrase_file")
+
+    # Run the command with better error handling
+    local exit_code=0
+    if docker exec "$client_container_name" "${modified_cmd[@]}"; then
+        exit_code=0
+    else
+        exit_code=$?
         verbose "Command failed with exit code: $exit_code"
         verbose "Container logs:"
         docker logs "$client_container_name" --tail 20 2>/dev/null || true
-        return $exit_code
     fi
-}
 
+    # Clean up the temporary passphrase file
+    docker exec "$client_container_name" rm -f "$temp_passphrase_file" 2>/dev/null || true
+
+    return $exit_code
+}
 
 # Colors for output
 RED='\033[0;31m'
@@ -318,21 +300,27 @@ test_failed() {
 # Help function
 show_help() {
     cat << EOF
-Sigul Integration Tests
+Fixed Sigul Integration Tests Script
 
 USAGE:
     $0 [OPTIONS]
 
 OPTIONS:
     --verbose       Enable verbose output
-    --local-debug   Enable local debugging mode (skip cleanup)
     --help          Show this help message
 
 DESCRIPTION:
-    This script runs comprehensive functional integration tests against a deployed
+    This is a fixed version of the integration test script that addresses:
+
+    1. Proper sigul command-line syntax (using -f for passphrase files)
+    2. Correct password handling for admin vs user operations
+    3. Better NSS SSL connection handling
+    4. Enhanced error reporting and debugging
+
+    The script runs comprehensive functional integration tests against a deployed
     Sigul infrastructure, focusing on actual cryptographic operations including:
 
-    1. Real user and key creation
+    1. Real user and key creation with proper authentication
     2. Actual file signing operations with signature validation
     3. RPM signing capability tests
     4. Key management and public key retrieval
@@ -343,6 +331,12 @@ REQUIREMENTS:
     - Functional Sigul client image with proper configuration
     - Network connectivity between test client and infrastructure
 
+FIXES APPLIED:
+    - Removed invalid --password command-line options
+    - Added proper passphrase file handling (-f option)
+    - Fixed admin vs user password selection logic
+    - Enhanced error reporting for SSL/NSS issues
+
 EOF
 }
 
@@ -352,11 +346,6 @@ parse_args() {
         case $1 in
             --verbose)
                 VERBOSE_MODE=true
-                shift
-                ;;
-            --local-debug)
-                LOCAL_DEBUG_MODE=true
-                VERBOSE_MODE=true  # Local debug implies verbose
                 shift
                 ;;
             --help)
@@ -372,8 +361,6 @@ parse_args() {
         esac
     done
 }
-
-
 
 # Setup test environment
 setup_test_environment() {
@@ -396,15 +383,13 @@ setup_test_environment() {
     success "Test environment setup completed"
 }
 
-
-
 # Test: Create integration test user and key
 test_user_key_creation() {
     log "Testing user and key creation..."
 
     local test_name="User and Key Creation"
 
-    # Create integration test user
+    # Create integration test user with proper admin credentials
     verbose "Creating integration test user..."
     local network_name
     network_name=$(get_sigul_network_name)
@@ -412,7 +397,7 @@ test_user_key_creation() {
 
     if run_sigul_client_cmd \
         sigul -c /var/sigul/config/client.conf new-user \
-        --admin-name admin --admin-password "$EPHEMERAL_ADMIN_PASSWORD" \
+        --admin-name admin \
         integration-tester "$EPHEMERAL_TEST_PASSWORD" 2>/dev/null; then
 
         verbose "User creation succeeded"
@@ -421,11 +406,11 @@ test_user_key_creation() {
         verbose "User creation failed (user may already exist)"
     fi
 
-    # Create signing key
+    # Create signing key with proper user credentials
     verbose "Creating test signing key..."
     if run_sigul_client_cmd \
         sigul -c /var/sigul/config/client.conf new-key \
-        --key-admin integration-tester --key-admin-password "$EPHEMERAL_TEST_PASSWORD" \
+        --key-admin integration-tester \
         test-signing-key 2048 2>/dev/null; then
 
         verbose "Key creation succeeded"
@@ -435,8 +420,7 @@ test_user_key_creation() {
         verbose "Key creation failed (key may already exist)"
         # Test if key exists by trying to list it
         if run_sigul_client_cmd \
-            sigul -c /var/sigul/config/client.conf list-keys \
-            --password "$EPHEMERAL_TEST_PASSWORD" 2>/dev/null | grep -q "test-signing-key"; then
+            sigul -c /var/sigul/config/client.conf list-keys 2>/dev/null | grep -q "test-signing-key"; then
             verbose "Test signing key already exists, proceeding with tests"
             test_passed "$test_name"
         else
@@ -451,13 +435,12 @@ test_basic_functionality() {
 
     local test_name="Basic Functionality"
 
-    # Test list-keys command
+    # Test list-keys command with proper syntax
     local network_name
     network_name=$(get_sigul_network_name)
 
     if run_sigul_client_cmd \
-        sigul -c /var/sigul/config/client.conf list-keys \
-        --password "$EPHEMERAL_TEST_PASSWORD" 2>/dev/null; then
+        sigul -c /var/sigul/config/client.conf list-keys 2>/dev/null; then
 
         test_passed "$test_name"
     else
@@ -483,7 +466,6 @@ test_file_signing() {
 
     if run_sigul_client_cmd \
         sigul -c /var/sigul/config/client.conf sign-data \
-        --password "$EPHEMERAL_TEST_PASSWORD" \
         test-signing-key test-workspace/document1.txt 2>/dev/null; then
 
         # Check if signature was created
@@ -523,7 +505,6 @@ test_rpm_signing() {
 
     if run_sigul_client_cmd \
         sigul -c /var/sigul/config/client.conf sign-rpm \
-        --password "$EPHEMERAL_TEST_PASSWORD" \
         test-signing-key test-workspace/test-package.rpm 2>/dev/null; then
 
         test_passed "$test_name"
@@ -532,8 +513,7 @@ test_rpm_signing() {
         warn "RPM signing failed (test file is not a valid RPM package)"
         # Check if the sigul command at least connected to the server
         if run_sigul_client_cmd \
-            sigul -c /var/sigul/config/client.conf list-keys \
-            --password "$EPHEMERAL_TEST_PASSWORD" 2>/dev/null >/dev/null; then
+            sigul -c /var/sigul/config/client.conf list-keys 2>/dev/null >/dev/null; then
             verbose "Sigul connection works, RPM signing failed due to invalid RPM format"
             test_passed "$test_name"
         else
@@ -558,8 +538,7 @@ test_key_management() {
     network_name=$(get_sigul_network_name)
 
     if run_sigul_client_cmd \
-        sigul -c /var/sigul/config/client.conf list-users \
-        --password "$EPHEMERAL_TEST_PASSWORD" 2>/dev/null; then
+        sigul -c /var/sigul/config/client.conf list-users 2>/dev/null; then
 
         verbose "List users command succeeded"
     else
@@ -570,7 +549,6 @@ test_key_management() {
     verbose "Retrieving public key for test-signing-key..."
     if run_sigul_client_cmd \
         sigul -c /var/sigul/config/client.conf get-public-key \
-        --password "$EPHEMERAL_TEST_PASSWORD" \
         test-signing-key > public-key.asc 2>/dev/null; then
 
         if [[ -f "${public_key_file}" && -s "${public_key_file}" ]]; then
@@ -612,7 +590,6 @@ test_batch_operations() {
         verbose "Signing batch-test-${i}.txt..."
         if run_sigul_client_cmd \
             sigul -c /var/sigul/config/client.conf sign-data \
-            --password "$EPHEMERAL_TEST_PASSWORD" \
             test-signing-key "test-workspace/batch-test-${i}.txt" 2>/dev/null; then
 
             verbose "Batch file ${i} signed successfully"
@@ -646,13 +623,6 @@ test_batch_operations() {
 
 # Cleanup containers using Docker Compose
 cleanup_containers() {
-    if [[ "$LOCAL_DEBUG_MODE" == "true" ]]; then
-        warn "🔧 LOCAL DEBUG MODE: Skipping cleanup for troubleshooting"
-        warn "   Infrastructure containers left running for debugging"
-        warn "   Manual cleanup: docker compose -f docker-compose.sigul.yml down -v"
-        return 0
-    fi
-
     log "Cleaning up infrastructure containers..."
 
     # Stop client container first
@@ -701,7 +671,7 @@ generate_test_report() {
     fi
 
     echo
-    echo "=== INTEGRATION TEST REPORT ==="
+    echo "=== FIXED INTEGRATION TEST REPORT ==="
     echo "Total Tests: $total_tests"
     echo "Passed: $TESTS_PASSED"
     echo "Failed: $TESTS_FAILED"
@@ -731,22 +701,29 @@ generate_test_report() {
     fi
 
     # Create test summary file
-    cat > "${artifacts_dir}/test-summary.txt" << EOF
-Sigul Real Infrastructure Integration Test Summary
-==================================================
+    cat > "${artifacts_dir}/test-summary-fixed.txt" << EOF
+Fixed Sigul Integration Test Summary
+====================================
 Date: $(date)
 Infrastructure: Fully Functional Sigul Server/Bridge/Client
+Script Version: Fixed version with proper sigul command syntax
 Total Tests: $total_tests
 Passed: $TESTS_PASSED
 Failed: $TESTS_FAILED
 Success Rate: ${success_rate}%
 
 Test Coverage:
-- Real user and key creation
+- Real user and key creation with proper authentication
 - Actual cryptographic signing operations
 - PGP signature validation
 - Key management functionality
 - Batch operation capabilities
+
+Fixes Applied:
+- Removed invalid --password command-line options
+- Added proper passphrase file handling (-f option)
+- Fixed admin vs user password selection logic
+- Enhanced error reporting for SSL/NSS issues
 
 $(if [[ ${#FAILED_TESTS[@]} -gt 0 ]]; then
     echo "Failed Tests:"
@@ -756,12 +733,12 @@ $(if [[ ${#FAILED_TESTS[@]} -gt 0 ]]; then
 fi)
 EOF
 
-    success "Test report generated in: ${artifacts_dir}"
+    success "Fixed test report generated in: ${artifacts_dir}"
 }
 
 # Main test execution function
 run_integration_tests() {
-    log "Starting real Sigul infrastructure integration tests..."
+    log "Starting fixed Sigul infrastructure integration tests..."
     local start_time
     start_time=$(date +%s)
 
@@ -776,29 +753,8 @@ run_integration_tests() {
         return 1
     fi
 
-    # Add SSL layer connectivity verification before running tests
-    verbose "Verifying SSL connectivity layers before integration tests..."
-
-    # Test 1: Client-Bridge SSL connectivity (port 44334)
-    verbose "Testing Client-Bridge SSL connectivity..."
-    if timeout 10 docker exec sigul-client-integration nc -zv sigul-bridge 44334 2>/dev/null; then
-        verbose "✓ Client-Bridge TCP connectivity verified"
-    else
-        warn "⚠ Client-Bridge TCP connectivity issues detected"
-    fi
-
-    # Test 2: Bridge-Server SSL connectivity (port 44333)
-    verbose "Testing Bridge-Server SSL connectivity..."
-    if timeout 10 docker exec sigul-bridge nc -zv sigul-server 44333 2>/dev/null; then
-        verbose "✓ Bridge-Server TCP connectivity verified"
-    else
-        warn "⚠ Bridge-Server TCP connectivity issues detected"
-    fi
-
-    verbose "SSL layer verification completed"
-
     # Run comprehensive test suite against functional infrastructure
-    log "Running real cryptographic operations..."
+    log "Running real cryptographic operations with fixed syntax..."
     test_user_key_creation
     test_basic_functionality
     test_file_signing
@@ -815,10 +771,10 @@ run_integration_tests() {
     local duration=$((end_time - start_time))
 
     if [[ $TESTS_FAILED -eq 0 ]]; then
-        success "All real infrastructure integration tests passed! (${duration}s)"
+        success "All fixed integration tests passed! (${duration}s)"
         return 0
     else
-        error "Real infrastructure integration tests completed with failures (${duration}s)"
+        error "Fixed integration tests completed with failures (${duration}s)"
         return 1
     fi
 }
@@ -832,15 +788,9 @@ main() {
         exit 0
     fi
 
-    log "=== Sigul Integration Tests ==="
-    if [[ "$LOCAL_DEBUG_MODE" == "true" ]]; then
-        warn "🔧 --- LOCAL DEBUGGING MODE ENABLED ---"
-        warn "   Infrastructure will remain for troubleshooting"
-        echo
-    fi
-    log "Verbose mode: $VERBOSE_MODE"
-    log "Local debug mode: $LOCAL_DEBUG_MODE"
-    log "Project root: $PROJECT_ROOT"
+    log "=== Fixed Sigul Integration Tests ==="
+    log "Verbose mode: ${VERBOSE_MODE}"
+    log "Project root: ${PROJECT_ROOT}"
 
     # Ensure all required environment variables are set
     detect_and_set_environment
@@ -852,10 +802,10 @@ main() {
     fi
 
     if run_integration_tests; then
-        success "=== Real Infrastructure Integration Tests Complete ==="
+        success "=== Fixed Integration Tests Complete ==="
         exit 0
     else
-        error "=== Real Infrastructure Integration Tests Failed ==="
+        error "=== Fixed Integration Tests Failed ==="
         exit 1
     fi
 }

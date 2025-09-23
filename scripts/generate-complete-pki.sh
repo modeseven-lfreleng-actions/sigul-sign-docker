@@ -27,18 +27,17 @@ TEST_PKI_DIR="$OUTPUT_DIR/pki"
 TEMP_DIR=$(mktemp -d -t sigul-complete-pki.XXXXXXXX)
 
 # PKI Configuration
-CA_DAYS=3650
+
 SERVER_DAYS=365
 CLIENT_DAYS=365
 RSA_BITS=2048
 
 # Generate ephemeral passwords for security
-CA_PASS=$(openssl rand -base64 16)
 CLIENT_PASS=$(openssl rand -base64 16)
 GPG_ENCRYPT_PASS=$(openssl rand -base64 16)
 
 # Subject configurations
-CA_SUBJECT="/C=US/ST=Test/L=TestCity/O=Sigul Test CA/CN=Sigul Test Root CA"
+
 SERVER_SUBJECT="/C=US/ST=Test/L=TestCity/O=Sigul Test/CN=sigul-server"
 BRIDGE_SUBJECT="/C=US/ST=Test/L=TestCity/O=Sigul Test/CN=sigul-bridge"
 CLIENT_SUBJECT="/C=US/ST=Test/L=TestCity/O=Sigul Test/CN=integration-tester"
@@ -95,7 +94,7 @@ cp "$repo_ca_key" "$TEMP_DIR/ca-key.pem"
 log "Using existing shared CA from repository: $repo_ca_cert"
 
 # Set up CA password (repository CA is unencrypted for testing)
-CA_PASS=""
+
 
 # Copy CA certificate to client PKI
 cp "$TEST_PKI_DIR/ca.crt" "$TEMP_DIR/client-pki/.sigul/ca.crt"
