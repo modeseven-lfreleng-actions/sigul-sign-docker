@@ -33,6 +33,8 @@ VERBOSE_MODE=false
 DEBUG_MODE=false
 LOCAL_DEBUG_MODE=false
 SHOW_HELP=false
+DEPLOYMENT_MODE="auto"  # auto, production, local, ci
+FORCE_CLEAN_VOLUMES=false
 
 # Colors for output
 RED='\033[0;31m'
@@ -105,10 +107,12 @@ USAGE:
     $0 [OPTIONS]
 
 OPTIONS:
-    --verbose       Enable verbose output
-    --debug         Enable debug mode with detailed diagnostics
-    --local-debug   Enable local debugging mode (persistent infrastructure)
-    --help          Show this help message
+    --verbose                Enable verbose output
+    --debug                  Enable debug mode with detailed diagnostics
+    --local-debug            Enable local debugging mode (persistent infrastructure)
+    --mode <MODE>            Set deployment mode: auto, production, local, ci
+    --force-clean-volumes    Force clean all volumes before deployment
+    --help                   Show this help message
 
 DESCRIPTION:
     This script deploys the Sigul infrastructure for integration testing
@@ -146,6 +150,14 @@ parse_args() {
             --local-debug)
                 LOCAL_DEBUG_MODE=true
                 VERBOSE_MODE=true  # Local debug implies verbose
+                shift
+                ;;
+            --mode)
+                DEPLOYMENT_MODE="$2"
+                shift 2
+                ;;
+            --force-clean-volumes)
+                FORCE_CLEAN_VOLUMES=true
                 shift
                 ;;
             --help)
@@ -793,9 +805,98 @@ load_infrastructure_images() {
 
 
 
+# Detect deployment mode and manage volumes accordingly
+detect_and_configure_deployment_mode() {
+    log "Detecting deployment mode and configuring volume management..."
+
+    # Auto-detect deployment mode if not explicitly set
+    if [[ "$DEPLOYMENT_MODE" == "auto" ]]; then
+        if is_github_actions; then
+            DEPLOYMENT_MODE="ci"
+        elif [[ "$LOCAL_DEBUG_MODE" == "true" ]]; then
+            DEPLOYMENT_MODE="local"
+        else
+            DEPLOYMENT_MODE="production"
+        fi
+    fi
+
+    log "Deployment mode: $DEPLOYMENT_MODE"
+
+    # Configure volume management based on deployment mode
+    case "$DEPLOYMENT_MODE" in
+        ci)
+            log "CI/CD mode: Using ephemeral volumes, ensuring clean state"
+            FORCE_CLEAN_VOLUMES=true
+            ;;
+        local)
+            log "Local testing mode: Volumes will persist for faster iteration"
+            if [[ "$FORCE_CLEAN_VOLUMES" == "true" ]]; then
+                log "Force clean requested: Will reset volumes"
+            fi
+            ;;
+        production)
+            log "Production mode: Volumes will persist, no automatic cleanup"
+            if [[ "$FORCE_CLEAN_VOLUMES" == "true" ]]; then
+                warn "Force clean requested in production mode - this will destroy data!"
+                warn "Sleeping 5 seconds for confirmation..."
+                sleep 5
+            fi
+            ;;
+        *)
+            error "Invalid deployment mode: $DEPLOYMENT_MODE"
+            return 1
+            ;;
+    esac
+}
+
+# Clean volumes if required by deployment mode
+manage_volumes() {
+    if [[ "$FORCE_CLEAN_VOLUMES" != "true" ]]; then
+        log "Volume persistence enabled - existing volumes will be reused"
+        return 0
+    fi
+
+    log "Cleaning existing volumes for fresh deployment..."
+
+    local compose_cmd
+    compose_cmd=$(get_docker_compose_cmd)
+
+    # Stop and remove containers first
+    if docker ps -q --filter "name=sigul" | grep -q .; then
+        log "Stopping existing Sigul containers..."
+        docker stop $(docker ps -q --filter "name=sigul") 2>/dev/null || true
+    fi
+
+    if docker ps -aq --filter "name=sigul" | grep -q .; then
+        log "Removing existing Sigul containers..."
+        docker rm $(docker ps -aq --filter "name=sigul") 2>/dev/null || true
+    fi
+
+    # Remove volumes
+    local volumes_to_remove=(
+        "sigul-sign-docker_sigul_server_data"
+        "sigul-sign-docker_sigul_bridge_data"
+        "sigul-sign-docker_sigul_client_data"
+        "sigul-sign-docker_sigul_monitor_data"
+    )
+
+    for volume in "${volumes_to_remove[@]}"; do
+        if docker volume ls -q | grep -q "^${volume}$"; then
+            log "Removing volume: $volume"
+            docker volume rm "$volume" 2>/dev/null || warn "Failed to remove volume: $volume"
+        fi
+    done
+
+    success "Volume cleanup completed"
+}
+
 # Deploy Sigul services with comprehensive monitoring
 deploy_sigul_services() {
     log "Deploying Sigul server and bridge with comprehensive monitoring..."
+
+    # Configure deployment mode and handle volumes
+    detect_and_configure_deployment_mode
+    manage_volumes
 
     local compose_cmd
     compose_cmd=$(get_docker_compose_cmd)
@@ -822,8 +923,8 @@ deploy_sigul_services() {
 
     # Store passwords for integration tests to use
     mkdir -p "${PROJECT_ROOT}/test-artifacts"
-    echo "$ephemeral_admin_password" > "${PROJECT_ROOT}/test-artifacts/admin-password"
-    echo "$ephemeral_nss_password" > "${PROJECT_ROOT}/test-artifacts/nss-password"
+    printf '%s' "$ephemeral_admin_password" > "${PROJECT_ROOT}/test-artifacts/admin-password"
+    printf '%s' "$ephemeral_nss_password" > "${PROJECT_ROOT}/test-artifacts/nss-password"
     chmod 600 "${PROJECT_ROOT}/test-artifacts/admin-password"
     chmod 600 "${PROJECT_ROOT}/test-artifacts/nss-password"
 

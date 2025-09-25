@@ -519,20 +519,32 @@ load_secret() {
 # Outputs:
 #   Password to stdout
 generate_nss_password() {
-    # Check if password already exists
-    if load_secret "nss_password" >/dev/null 2>&1; then
-        load_secret "nss_password"
-        return 0
-    fi
-
-    # Check environment variable - but ignore placeholder values
+    # Priority 1: Use environment variable if it's a real password (not placeholder)
     if [[ -n "${NSS_PASSWORD:-}" ]] && [[ "$NSS_PASSWORD" != *"auto_generated"* ]] && [[ "$NSS_PASSWORD" != *"ephemeral"* ]]; then
+        # For persistent volumes: if password file exists and differs from env var, we have a mismatch
+        if load_secret "nss_password" >/dev/null 2>&1; then
+            local existing_password
+            existing_password=$(load_secret "nss_password")
+            if [[ "$existing_password" != "$NSS_PASSWORD" ]]; then
+                log "WARNING: Environment NSS_PASSWORD differs from existing password file"
+                log "This indicates either:"
+                log "  - Volume persistence with password change (need volume reset)"
+                log "  - Deployment configuration mismatch"
+                log "Using environment variable to maintain consistency"
+            fi
+        fi
         store_secret "nss_password" "$NSS_PASSWORD"
         echo "$NSS_PASSWORD"
         return 0
     fi
 
-    # Generate new password (either no env var or placeholder detected)
+    # Priority 2: Use existing password file if available (for persistent volumes)
+    if load_secret "nss_password" >/dev/null 2>&1; then
+        load_secret "nss_password"
+        return 0
+    fi
+
+    # Priority 3: Generate new password (fresh deployment or CI/CD)
     local password
     password=$(generate_password "$NSS_PASSWORD_LENGTH")
 
@@ -1127,7 +1139,7 @@ create_nss_database() {
     log "Password length for NSS creation: $(printf '%s' "$nss_password" | wc -c)"
     log "Password hexdump for NSS creation: $(printf '%s' "$nss_password" | hexdump -C)"
 
-    if ! echo "$nss_password" | certutil -N -d "$nss_dir" -f /dev/stdin; then
+    if ! printf '%s' "$nss_password" | certutil -N -d "$nss_dir" -f /dev/stdin; then
         error "Failed to create NSS database for role: $role"
     fi
 
@@ -1216,16 +1228,26 @@ import_nss_certificates() {
             esac
 
             # Check if certificate already exists
-            if echo "$nss_password" | certutil -L -d "$nss_dir" -n "$cert_nickname" -f /dev/stdin >/dev/null 2>&1; then
+            if printf '%s' "$nss_password" | certutil -L -d "$nss_dir" -n "$cert_nickname" -f /dev/stdin >/dev/null 2>&1; then
                 debug "Certificate already exists: $cert_name as $cert_nickname, skipping import"
                 ((imported_count++))
             else
-                log "Importing certificate: $cert_name as nickname: $cert_nickname"
-                if echo "$nss_password" | certutil -A -d "$nss_dir" -n "$cert_nickname" -t "CT,C,C" -i "$cert_file" -f /dev/stdin; then
-                    ((imported_count++))
-                    debug "Successfully imported: $cert_name as $cert_nickname"
+                # Determine appropriate trust flags based on certificate type
+                local trust_flags
+                if [[ "$cert_name" == "ca" ]]; then
+                    trust_flags="CT,C,C"  # CA certificate: Certificate Authority trusted for SSL, S/MIME, code signing
+                    debug "Using CA trust flags (CT,C,C) for certificate: $cert_name"
                 else
-                    error "Failed to import certificate: $cert_name as $cert_nickname"
+                    trust_flags="u,u,u"   # End-entity certificate: User certificate for SSL, S/MIME, code signing
+                    debug "Using user trust flags (u,u,u) for certificate: $cert_name"
+                fi
+
+                log "Importing certificate: $cert_name as nickname: $cert_nickname with trust flags: $trust_flags"
+                if printf '%s' "$nss_password" | certutil -A -d "$nss_dir" -n "$cert_nickname" -t "$trust_flags" -i "$cert_file" -f /dev/stdin; then
+                    ((imported_count++))
+                    debug "Successfully imported: $cert_name as $cert_nickname with trust flags: $trust_flags"
+                else
+                    error "Failed to import certificate: $cert_name as $cert_nickname with trust flags: $trust_flags"
                 fi
             fi
 
@@ -1362,9 +1384,9 @@ generate_nss_import_summary() {
         local nss_password
         if nss_password=$(load_secret "nss_password" "$role" 2>/dev/null); then
             echo "Certificates in NSS database:"
-            if echo "$nss_password" | certutil -L -d "$SIGUL_BASE_DIR/nss/$role" -f /dev/stdin 2>/dev/null; then
+            if printf '%s' "$nss_password" | certutil -L -d "$SIGUL_BASE_DIR/nss/$role" -f /dev/stdin 2>/dev/null; then
                 echo "Private keys in NSS database:"
-                echo "$nss_password" | certutil -K -d "$SIGUL_BASE_DIR/nss/$role" -f /dev/stdin 2>/dev/null || echo "  (unable to list private keys)"
+                printf '%s' "$nss_password" | certutil -K -d "$SIGUL_BASE_DIR/nss/$role" -f /dev/stdin 2>/dev/null || echo "  (unable to list private keys)"
             else
                 echo "  (unable to access NSS database)"
             fi
@@ -1401,13 +1423,13 @@ validate_nss_database() {
     fi
 
     # Test NSS database accessibility
-    if ! echo "$nss_password" | certutil -L -d "$nss_dir" -f /dev/stdin >/dev/null 2>&1; then
+    if ! printf '%s' "$nss_password" | certutil -L -d "$nss_dir" -f /dev/stdin >/dev/null 2>&1; then
         error "NSS database is not accessible or corrupted for role: $role"
     fi
 
     # List certificates in database
     local cert_count
-    cert_count=$(echo "$nss_password" | certutil -L -d "$nss_dir" -f /dev/stdin 2>/dev/null | grep -c "^[[:space:]]*[^[:space:]]" || echo "0")
+    cert_count=$(printf '%s' "$nss_password" | certutil -L -d "$nss_dir" -f /dev/stdin 2>/dev/null | grep -c "^[[:space:]]*[^[:space:]]" || echo "0")
 
     debug "NSS database validation successful for role: $role"
     debug "Found $cert_count certificate(s) in database"
@@ -1484,7 +1506,7 @@ perform_nss_integrity_deep_check() {
         echo ""
 
         echo "=== Certificate Database Listing (certutil -L) ==="
-        if echo "$nss_password" | certutil -L -d "$nss_dir" -f /dev/stdin 2>&1; then
+        if printf '%s' "$nss_password" | certutil -L -d "$nss_dir" -f /dev/stdin 2>&1; then
             echo "✅ Certificate listing successful"
         else
             echo "❌ Certificate listing failed"
@@ -1496,7 +1518,7 @@ perform_nss_integrity_deep_check() {
 
         echo "=== Private Key Database Listing (certutil -K) ==="
         local key_list_result
-        if key_list_result=$(echo "$nss_password" | certutil -K -d "$nss_dir" -f /dev/stdin 2>&1); then
+        if key_list_result=$(printf '%s' "$nss_password" | certutil -K -d "$nss_dir" -f /dev/stdin 2>&1); then
             echo "$key_list_result"
             echo "✅ Private key listing successful"
 
@@ -1749,34 +1771,29 @@ generate_client_config() {
     export SIGUL_BASE_DIR="${SIGUL_BASE_DIR:-/var/sigul}"
 
     # Create client configuration content with variable substitution
-    cat > "$config_file" << CLIENT_CONFIG_EOF
+    cat > "$config_file" <<EOF
 # Sigul Client Configuration
 # Generated by sigul-init.sh
 
 [client]
 # Bridge connection configuration
-bridge-hostname = ${SIGUL_BRIDGE_HOSTNAME}
-bridge-port = ${SIGUL_BRIDGE_CLIENT_PORT}
-server-hostname = ${SIGUL_SERVER_HOST:-sigul-server}
+bridge-hostname = ${SIGUL_BRIDGE_HOSTNAME:-sigul-bridge}
+bridge-port = ${SIGUL_BRIDGE_CLIENT_PORT:-44334}
+server-hostname = ${SIGUL_SERVER_HOSTNAME:-sigul-server}
 client-cert-nickname = sigul-client-cert
-username = integration-tester
 
-# SSL/TLS configuration
-ca-cert-file = ${SIGUL_BASE_DIR}/secrets/certificates/ca.crt
-client-cert-file = ${SIGUL_BASE_DIR}/secrets/certificates/client.crt
-client-key-file = ${SIGUL_BASE_DIR}/secrets/certificates/client-key.pem
+# SSL/TLS configuration - using NSS database only
 require-tls = true
 verify-server-cert = true
 
 # NSS Configuration
 [nss]
-nss-dir = ${SIGUL_NSS_DIR}
-nss-password = ${nss_password}
+nss-dir = $nss_dir
+nss-password = $nss_password
 
 # Client logging uses stderr by default (no file logging for non-daemon clients)
 # For consistency, client logs are available in the container output
-
-CLIENT_CONFIG_EOF
+EOF
 
     # Set proper permissions
     chmod 640 "$config_file"
@@ -2093,28 +2110,32 @@ setup_admin_user() {
 
     # Create admin user using official sigul command
     log "Creating admin user using sigul_server_add_admin..."
-    debug "Running: sigul_server_add_admin --config-file=$config_file --batch"
+    debug "Running: sigul_server_add_admin --config-file=$config_file --batch --name=admin"
 
     local add_admin_output
-    if add_admin_output=$(echo -e "admin\n$admin_password" | sigul_server_add_admin --config-file="$config_file" --batch 2>&1); then
+    # Use printf with NUL termination as expected by --batch mode
+    if add_admin_output=$(printf "%s\0" "$admin_password" | sigul_server_add_admin --config-file="$config_file" --batch --name=admin 2>&1); then
         log "Admin user created successfully"
         debug "Admin creation output: $add_admin_output"
         return 0
     else
         debug "Admin creation failed with output: $add_admin_output"
 
-        # Check if user already exists (common case)
-        local list_output
-        if list_output=$(sigul_server_add_admin --config-file="$config_file" --name=admin --list 2>&1) && echo "$list_output" | grep -q "admin"; then
-            log "Admin user already exists, skipping creation"
-            debug "Existing admin user confirmed: $list_output"
-            return 0
-        else
-            warn "Failed to add admin user - server will start without admin user"
-            debug "List users output: $list_output"
-            log "Admin user can be created manually after server startup"
-            return 0
+        # Check if user already exists by querying the database directly
+        local db_file="/var/sigul/database/sigul.db"
+        if [[ -f "$db_file" ]]; then
+            local user_count
+            if user_count=$(sqlite3 "$db_file" "SELECT COUNT(*) FROM users WHERE name='admin';" 2>/dev/null) && [[ "$user_count" -gt 0 ]]; then
+                log "Admin user already exists in database, skipping creation"
+                debug "Found $user_count admin user(s) in database"
+                return 0
+            fi
         fi
+
+        log "Failed to add admin user - server will start without admin user"
+        debug "Admin creation command output: $add_admin_output"
+        log "Admin user can be created manually after server startup"
+        return 0
     fi
 }
 
@@ -2429,7 +2450,7 @@ validate_nss_nicknames() {
     fi
 
     # Test NSS database accessibility
-    if ! echo "$nss_password" | certutil -L -d "$nss_dir" -f /dev/stdin >/dev/null 2>&1; then
+    if ! printf '%s' "$nss_password" | certutil -L -d "$nss_dir" -f /dev/stdin >/dev/null 2>&1; then
         error "NSS database is not accessible for role: $role"
         return 1
     fi
@@ -2450,7 +2471,7 @@ validate_nss_nicknames() {
 
     # Check for expected certificate nicknames
     for nickname in "${expected_nicknames[@]}"; do
-        if ! echo "$nss_password" | certutil -L -d "$nss_dir" -f /dev/stdin | grep -q "$nickname"; then
+        if ! printf '%s' "$nss_password" | certutil -L -d "$nss_dir" -f /dev/stdin | grep -q "$nickname"; then
             error "NSS database missing expected certificate nickname: $nickname"
             return 1
         fi

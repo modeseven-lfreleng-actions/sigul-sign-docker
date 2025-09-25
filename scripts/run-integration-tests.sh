@@ -64,6 +64,7 @@ detect_and_set_environment() {
 # Function to load ephemeral passwords generated during deployment
 load_ephemeral_passwords() {
     local admin_password_file="${PROJECT_ROOT}/test-artifacts/admin-password"
+    local nss_password_file="${PROJECT_ROOT}/test-artifacts/nss-password"
 
     # Load admin password
     if [[ -f "$admin_password_file" ]]; then
@@ -71,6 +72,15 @@ load_ephemeral_passwords() {
         verbose "Loaded ephemeral admin password from deployment"
     else
         error "Ephemeral admin password not found. Deployment may have failed."
+        return 1
+    fi
+
+    # Load NSS password
+    if [[ -f "$nss_password_file" ]]; then
+        EPHEMERAL_NSS_PASSWORD=$(cat "$nss_password_file")
+        verbose "Loaded ephemeral NSS password from deployment"
+    else
+        error "Ephemeral NSS password not found. Deployment may have failed."
         return 1
     fi
 
@@ -119,7 +129,7 @@ start_client_container() {
         -e SIGUL_BRIDGE_HOSTNAME=sigul-bridge \
         -e SIGUL_BRIDGE_CLIENT_PORT=44334 \
         -e SIGUL_MOCK_MODE=false \
-        -e NSS_PASSWORD="${EPHEMERAL_ADMIN_PASSWORD}" \
+        -e NSS_PASSWORD="${EPHEMERAL_NSS_PASSWORD}" \
         -e DEBUG=true \
         "$SIGUL_CLIENT_IMAGE" \
         tail -f /dev/null; then
@@ -159,12 +169,21 @@ start_client_container() {
             warn "Client NSS database not found"
         fi
 
-        # Apply SSL certificate fix to resolve "Unexpected EOF in NSPR" error
-        verbose "Applying SSL certificate fix for client-bridge authentication..."
+        # Apply SSL certificate fixes to resolve "Unexpected EOF in NSPR" error
+        verbose "Applying SSL certificate fixes for client-bridge authentication..."
+
+        # Import client certificate to bridge (for bridge to validate client)
         if import_client_cert_to_bridge "$client_container_name"; then
-            verbose "SSL certificate fix applied successfully"
+            verbose "Client certificate imported to bridge successfully"
         else
-            warn "SSL certificate fix failed - SSL connections may not work"
+            warn "Client certificate import to bridge failed - SSL connections may not work"
+        fi
+
+        # Import bridge certificate to client (for client to validate bridge)
+        if import_bridge_cert_to_client "$client_container_name"; then
+            verbose "Bridge certificate imported to client successfully"
+        else
+            warn "Bridge certificate import to client failed - SSL connections may not work"
         fi
 
         return 0
@@ -230,6 +249,68 @@ import_client_cert_to_bridge() {
     rm -f /tmp/current-client-cert.pem 2>/dev/null || true
     # shellcheck disable=SC2317  # Cleanup code may be unreachable in some execution paths
     docker exec "$bridge_container" rm -f /tmp/current-client-cert.pem 2>/dev/null || true
+}
+
+# Import bridge certificate to client for SSL server authentication
+# This ensures the client can validate the bridge's SSL certificate
+import_bridge_cert_to_client() {
+    local client_container="$1"
+    local bridge_container="sigul-bridge"
+
+    verbose "Importing bridge certificate to client for SSL server authentication..."
+
+    # Wait for bridge container to be fully initialized with NSS database
+    local max_wait=30
+    local wait_count=0
+    while [[ $wait_count -lt $max_wait ]]; do
+        if docker exec "$bridge_container" test -f /var/sigul/nss/bridge/cert9.db 2>/dev/null; then
+            break
+        fi
+        sleep 1
+        ((wait_count++))
+    done
+
+    if [[ $wait_count -ge $max_wait ]]; then
+        error "Timeout waiting for bridge NSS database initialization"
+        return 1
+    fi
+
+    # Remove any existing/stale bridge certificate from client
+    docker exec "$client_container" certutil -D -d /var/sigul/nss/client -n sigul-bridge-cert 2>/dev/null || true
+
+    # Export current bridge certificate from bridge container
+    if ! docker exec "$bridge_container" certutil -L -d /var/sigul/nss/bridge -n sigul-bridge-cert -a > /tmp/current-bridge-cert.pem 2>/dev/null; then
+        error "Failed to export bridge certificate from bridge container"
+        return 1
+    fi
+
+    # Import to client with proper trust flags for SSL server authentication
+    docker cp /tmp/current-bridge-cert.pem "$client_container":/tmp/
+
+    if printf '%s' "$(cat /var/sigul/secrets/client_nss_password || docker exec "$client_container" cat /var/sigul/secrets/client_nss_password)" | docker exec -i "$client_container" certutil -A -d /var/sigul/nss/client \
+        -n sigul-bridge-cert \
+        -t "P,," \
+        -a -i /tmp/current-bridge-cert.pem \
+        -f /dev/stdin 2>/dev/null; then
+
+        success "Bridge certificate imported to client NSS database"
+
+        # Verify the import
+        if docker exec "$client_container" certutil -L -d /var/sigul/nss/client -n sigul-bridge-cert >/dev/null 2>&1; then
+            verbose "SSL certificate fix verified: bridge cert now in client NSS database"
+        else
+            warn "SSL certificate import verification failed"
+        fi
+    else
+        error "Failed to import bridge certificate to client"
+        return 1
+    fi
+
+    # Cleanup temporary files
+    rm -f /tmp/current-bridge-cert.pem 2>/dev/null || true
+    docker exec "$client_container" rm -f /tmp/current-bridge-cert.pem 2>/dev/null || true
+
+    return 0
 }
 
 # Stop the persistent client container
